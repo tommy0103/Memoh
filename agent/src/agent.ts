@@ -199,7 +199,7 @@ export const createAgent = (
     )
     return { ...input, attachments }
   }
-  
+
   const generateSystemPrompt = async (turnContext?: string) => {
     const { identityContent, soulContent, toolsContent } =
       await loadSystemFiles()
@@ -302,7 +302,7 @@ export const createAgent = (
       if (img.base64) {
         return { type: 'image', image: img.base64 } as ImagePart
        }
-        if (img.url) {
+      if (img.url) {
           return { type: 'image', image: img.url } as ImagePart
         }
         return { type: 'image', image: '' } as ImagePart
@@ -457,7 +457,6 @@ export const createAgent = (
   }
 
   async function* stream(input: AgentInput): AsyncGenerator<AgentAction> {
-
     const preparedInput = await prepareInputWithMCPImageBase64(input)
     const { turnContext, userMessage } = generateUserTurn(preparedInput)
     const messages = [...preparedInput.messages, userMessage]
