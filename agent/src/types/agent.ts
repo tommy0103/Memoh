@@ -7,6 +7,7 @@ export interface IdentityContext {
   botId: string
   containerId: string
   channelIdentityId: string
+  speakerAlias?: string
   displayName: string
   currentPlatform?: string
   conversationType?: string
