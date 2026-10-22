@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -109,6 +110,8 @@ type fakeQueries struct {
 	claims           map[pgtype.UUID]pgtype.UUID
 	logStatuses      map[pgtype.UUID]string
 	parentSuccessors map[pgtype.UUID]pgtype.UUID
+	activeRangeRows  []sqlc.ListActiveSessionMessageIDsInRangeRow
+	activeRangeErr   error
 
 	created         bool
 	createArg       sqlc.CreateCompactionLogParams
@@ -149,6 +152,25 @@ func (f *fakeQueries) ListUncompactedMessagesBySession(_ context.Context, _ pgty
 		<-f.listRelease
 	}
 	return f.uncompacted, nil
+}
+
+func (f *fakeQueries) ListActiveSessionMessageIDsInRange(_ context.Context, arg sqlc.ListActiveSessionMessageIDsInRangeParams) ([]sqlc.ListActiveSessionMessageIDsInRangeRow, error) {
+	if f.activeRangeErr != nil {
+		return nil, f.activeRangeErr
+	}
+	// Mirror the SQL bounds: [after, until] inclusive, matching the anchored
+	// load's >= anchor semantics.
+	rows := make([]sqlc.ListActiveSessionMessageIDsInRangeRow, 0, len(f.activeRangeRows))
+	for _, row := range f.activeRangeRows {
+		if arg.After.Valid && row.CreatedAt.Valid && row.CreatedAt.Time.Before(arg.After.Time) {
+			continue
+		}
+		if arg.Until.Valid && row.CreatedAt.Valid && row.CreatedAt.Time.After(arg.Until.Time) {
+			continue
+		}
+		rows = append(rows, row)
+	}
+	return rows, nil
 }
 
 func (f *fakeQueries) MeasureUncompactedMessagesBySession(_ context.Context, _ pgtype.UUID) (sqlc.MeasureUncompactedMessagesBySessionRow, error) {
@@ -263,6 +285,33 @@ func (f *fakeQueries) CompleteCompactionRollup(_ context.Context, arg sqlc.Compl
 	}
 	for _, parentID := range arg.Parents {
 		f.parentSuccessors[parentID] = arg.ID
+	}
+	// Mirror the SQL: mark parents superseded (the rows stay, the lineage
+	// resolver needs them) and surface the rollup artifact on the frontier.
+	if arg.Status == "ok" {
+		var scope sqlc.BotHistoryMessageCompact
+		for i, row := range f.priorLogs {
+			for _, parentID := range arg.Parents {
+				if row.ID == parentID {
+					f.priorLogs[i].SupersededBy = arg.ID
+					f.priorLogs[i].SupersededAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+					scope = row
+					break
+				}
+			}
+		}
+		f.priorLogs = append(f.priorLogs, sqlc.BotHistoryMessageCompact{
+			ID:            arg.ID,
+			BotID:         scope.BotID,
+			SessionID:     scope.SessionID,
+			Status:        arg.Status,
+			Summary:       arg.Summary,
+			Coverage:      arg.Coverage,
+			AnchorStartMs: arg.AnchorStartMs,
+			AnchorEndMs:   arg.AnchorEndMs,
+			ArtifactLevel: arg.Level,
+			ParentIds:     arg.Parents,
+		})
 	}
 	return sqlc.BotHistoryMessageCompact{ID: arg.ID, Status: arg.Status, Summary: arg.Summary}, nil
 }
