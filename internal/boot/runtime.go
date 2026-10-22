@@ -7,14 +7,18 @@ import (
 	"strings"
 	"time"
 
-	"github.com/memohai/memoh/internal/config"
+	"github.com/felinics/memoh/internal/config"
+	"github.com/felinics/memoh/internal/timezone"
 )
 
 type RuntimeConfig struct {
-	JwtSecret            string
+	JwtSecret            string `json:"-"`
 	JwtExpiresIn         time.Duration
 	ServerAddr           string
 	ContainerdSocketPath string
+	ContainerBackend     string // "docker", "containerd", or "apple"
+	Timezone             string
+	TimezoneLocation     *time.Location
 }
 
 func ProvideRuntimeConfig(cfg config.Config) (*RuntimeConfig, error) {
@@ -27,11 +31,28 @@ func ProvideRuntimeConfig(cfg config.Config) (*RuntimeConfig, error) {
 		return nil, fmt.Errorf("invalid jwt expires in: %w", err)
 	}
 
+	backend := normalizeContainerBackend(cfg.Container.Backend)
+	if backend == "" {
+		return nil, errors.New("container backend is required; set [container].backend to docker, containerd, or apple")
+	}
+
+	tzName := strings.TrimSpace(cfg.Timezone)
+	if envTZ := strings.TrimSpace(os.Getenv("TZ")); envTZ != "" {
+		tzName = envTZ
+	}
+	tzLocation, resolvedTZ, err := timezone.Resolve(tzName)
+	if err != nil {
+		return nil, err
+	}
+
 	ret := &RuntimeConfig{
 		JwtSecret:            cfg.Auth.JWTSecret,
 		JwtExpiresIn:         jwtExpiresIn,
 		ServerAddr:           cfg.Server.Addr,
 		ContainerdSocketPath: cfg.Containerd.SocketPath,
+		ContainerBackend:     backend,
+		Timezone:             resolvedTZ,
+		TimezoneLocation:     tzLocation,
 	}
 
 	if value := os.Getenv("HTTP_ADDR"); value != "" {
@@ -42,4 +63,13 @@ func ProvideRuntimeConfig(cfg config.Config) (*RuntimeConfig, error) {
 		ret.ContainerdSocketPath = value
 	}
 	return ret, nil
+}
+
+func normalizeContainerBackend(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "apple", "containerd", "docker":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return strings.TrimSpace(value)
+	}
 }

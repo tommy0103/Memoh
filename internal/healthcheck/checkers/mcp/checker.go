@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/memohai/memoh/internal/healthcheck"
-	"github.com/memohai/memoh/internal/mcp"
+	"github.com/felinics/memoh/internal/healthcheck"
+	"github.com/felinics/memoh/internal/mcp"
 )
 
 const (
@@ -53,16 +53,13 @@ func NewChecker(log *slog.Logger, connections ConnectionLister, tools ToolLister
 
 // ListChecks evaluates all active MCP connections for a bot.
 func (c *Checker) ListChecks(ctx context.Context, botID string) []healthcheck.CheckResult {
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	botID = strings.TrimSpace(botID)
 	if botID == "" {
 		return []healthcheck.CheckResult{}
 	}
 	if c.connections == nil || c.tools == nil {
 		if c.logger != nil {
-			c.logger.Warn(
+			c.logger.WarnContext(ctx,
 				"mcp healthcheck dependencies are unavailable",
 				slog.String("bot_id", botID),
 				slog.Bool("has_connection_lister", c.connections != nil),
@@ -84,7 +81,7 @@ func (c *Checker) ListChecks(ctx context.Context, botID string) []healthcheck.Ch
 	items, err := c.connections.ListActiveByBot(ctx, botID)
 	if err != nil {
 		if c.logger != nil {
-			c.logger.Warn(
+			c.logger.WarnContext(ctx,
 				"mcp healthcheck list connections failed",
 				slog.String("bot_id", botID),
 				slog.Any("error", err),
@@ -120,7 +117,7 @@ func (c *Checker) ListChecks(ctx context.Context, botID string) []healthcheck.Ch
 	tools, err := c.tools.ListTools(probeCtx, mcp.ToolSessionContext{BotID: botID})
 	if err != nil {
 		if c.logger != nil {
-			c.logger.Warn(
+			c.logger.WarnContext(ctx,
 				"mcp healthcheck list tools failed",
 				slog.String("bot_id", botID),
 				slog.Any("error", err),
@@ -152,7 +149,7 @@ func (c *Checker) ListChecks(ctx context.Context, botID string) []healthcheck.Ch
 		prefix := sanitizeToolPrefix(conn.Name)
 		toolCount := 0
 		if prefix != "" {
-			toolPrefix := prefix + "."
+			toolPrefix := prefix + "_"
 			for _, tool := range tools {
 				if strings.HasPrefix(strings.TrimSpace(tool.Name), toolPrefix) {
 					toolCount++

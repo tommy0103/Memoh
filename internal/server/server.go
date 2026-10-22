@@ -2,19 +2,25 @@ package server
 
 import (
 	"context"
+	"encoding/hex"
 	"log/slog"
+	"net"
 	"strings"
 
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 
-	"github.com/memohai/memoh/internal/auth"
+	"github.com/felinics/memoh/internal/auth"
+	"github.com/felinics/memoh/internal/channel/publicmedia"
+	"github.com/felinics/memoh/internal/httpx"
+	"github.com/felinics/memoh/internal/telemetry"
 )
 
 type Server struct {
-	echo   *echo.Echo
-	addr   string
-	logger *slog.Logger
+	stopRequests context.CancelFunc
+	echo         *echo.Echo
+	addr         string
+	logger       *slog.Logger
 }
 
 type Handler interface {
@@ -24,38 +30,56 @@ type Handler interface {
 func NewServer(log *slog.Logger, addr string, jwtSecret string,
 	handlers ...Handler,
 ) *Server {
+	return newServer(log, addr, jwtSecret, nil, handlers...)
+}
+
+func NewServerWithSessionValidator(log *slog.Logger, addr string, jwtSecret string,
+	validateSession auth.UserSessionValidator, handlers ...Handler,
+) *Server {
+	return newServer(log, addr, jwtSecret, validateSession, handlers...)
+}
+
+func newServer(log *slog.Logger, addr string, jwtSecret string,
+	validateSession auth.UserSessionValidator, handlers ...Handler,
+) *Server {
 	if addr == "" {
 		addr = ":8080"
 	}
 
 	e := echo.New()
+	e.Binder = &httpx.Binder{}
+	requestCtx, stopRequests := context.WithCancel(context.Background())
+	baseContext := func(net.Listener) context.Context { return requestCtx }
+	e.Server.BaseContext = baseContext
+	e.TLSServer.BaseContext = baseContext
 	e.HideBanner = true
-	e.Use(middleware.Recover())
-	e.Use(middleware.RequestLoggerWithConfig(middleware.RequestLoggerConfig{
-		LogStatus: true,
-		LogURI:    true,
-		LogMethod: true,
-		LogValuesFunc: func(c echo.Context, v middleware.RequestLoggerValues) error {
-			log.Info("request",
-				slog.String("method", v.Method),
-				slog.String("uri", v.URI),
-				slog.Int("status", v.Status),
-				slog.Duration("latency", v.Latency),
-				slog.String("remote_ip", c.RealIP()),
-			)
-			return nil
+	e.HTTPErrorHandler = NewHTTPErrorHandler(log)
+	e.Use(httpx.AssignRequestID())
+	// Directly after AssignRequestID: everything below, and every handler, logs with
+	// a context that carries the id.
+	e.Use(httpx.RequestIDContext)
+	// After RequestIDContext so the span can carry the id the client is given,
+	// and before everything else so the span covers the work they do.
+	e.Use(telemetry.EchoServer)
+	// Directly after the span: the result record is logged with it, and a
+	// panic or error anywhere below is answered and recorded here.
+	e.Use(AccessLog(log))
+	e.Use(middleware.BodyLimitWithConfig(middleware.BodyLimitConfig{
+		Limit: "1M",
+		Skipper: func(c echo.Context) bool {
+			return !shouldLimitPublicRequestBody(c.Request().URL.Path)
 		},
 	}))
-	e.Use(auth.JWTMiddleware(jwtSecret, func(c echo.Context) bool {
-		path := c.Request().URL.Path
-		if path == "/ping" || path == "/health" || path == "/api/swagger.json" || path == "/auth/login" {
-			return true
-		}
-		if strings.HasPrefix(path, "/api/docs") {
-			return true
-		}
-		return false
+	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
+		AllowOrigins:  []string{"*"},
+		AllowMethods:  []string{echo.GET, echo.HEAD, echo.POST, echo.PUT, echo.PATCH, echo.DELETE, echo.OPTIONS},
+		AllowHeaders:  []string{echo.HeaderOrigin, echo.HeaderContentType, echo.HeaderAccept, echo.HeaderAuthorization, echo.HeaderXRequestID, "Idempotency-Key"},
+		ExposeHeaders: []string{echo.HeaderXRequestID},
 	}))
+	e.Use(recordUpgradeStatus)
+	e.Use(auth.JWTMiddleware(jwtSecret, func(c echo.Context) bool {
+		return shouldSkipJWT(c.Request().URL.Path)
+	}, validateSession))
 
 	for _, h := range handlers {
 		if h != nil {
@@ -64,7 +88,7 @@ func NewServer(log *slog.Logger, addr string, jwtSecret string,
 	}
 
 	return &Server{
-		echo:   e,
+		stopRequests: stopRequests, echo: e,
 		addr:   addr,
 		logger: log.With(slog.String("component", "server")),
 	}
@@ -75,5 +99,71 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) Stop(ctx context.Context) error {
+	// Agent interruption is recorded by the earlier lifecycle hook. Cancel
+	// request contexts now so SSE handlers release before their hubs are closed
+	// by later hooks; otherwise HTTP drain consumes the whole shutdown budget.
+	if s.stopRequests != nil {
+		s.stopRequests()
+	}
 	return s.echo.Shutdown(ctx)
+}
+
+func shouldSkipJWT(path string) bool {
+	if path == "/" || path == "/ping" || path == "/health" || path == "/ready" || path == "/api/swagger.json" || path == "/auth/login" || path == "/runtimes/connect" {
+		return true
+	}
+	if strings.HasPrefix(path, "/assets/") {
+		return true
+	}
+	if isPublicSupermarketSkillIconPath(path) {
+		return true
+	}
+	if strings.HasPrefix(path, "/api/docs") {
+		return true
+	}
+	if isPublicChannelWebhookPath(path) {
+		return true
+	}
+	if isPublicChannelMediaPath(path) {
+		return true
+	}
+	if strings.HasPrefix(path, "/oauth/mcp/callback") || strings.HasPrefix(path, "/api/oauth/mcp/callback") {
+		return true
+	}
+	if strings.HasPrefix(path, "/providers/oauth/callback") {
+		return true
+	}
+	if strings.HasPrefix(path, "/auth/callback") {
+		return true
+	}
+	return false
+}
+
+func isPublicSupermarketSkillIconPath(path string) bool {
+	digest, found := strings.CutPrefix(path, "/supermarket/artifacts/icon/")
+	if !found {
+		digest, found = strings.CutPrefix(path, "/workspace-dependencies/icons/")
+	}
+	if !found || len(digest) != 64 || strings.ToLower(digest) != digest {
+		return false
+	}
+	_, err := hex.DecodeString(digest)
+	return err == nil
+}
+
+func shouldLimitPublicRequestBody(path string) bool {
+	return isPublicChannelWebhookPath(path)
+}
+
+func isPublicChannelWebhookPath(path string) bool {
+	if !strings.HasPrefix(path, "/channels/") {
+		return false
+	}
+	trimmed := strings.Trim(strings.TrimPrefix(path, "/channels/"), "/")
+	parts := strings.Split(trimmed, "/")
+	return len(parts) >= 3 && strings.TrimSpace(parts[0]) != "" && parts[1] == "webhook" && strings.TrimSpace(parts[2]) != ""
+}
+
+func isPublicChannelMediaPath(path string) bool {
+	return publicmedia.IsPath(path)
 }

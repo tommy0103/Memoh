@@ -1,0 +1,221 @@
+package application
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	historyfrag "github.com/felinics/memoh/internal/agent/context/history"
+	messagepkg "github.com/felinics/memoh/internal/chat/message"
+	"github.com/felinics/memoh/internal/db/postgres/sqlc"
+)
+
+type memoryQueryMessageService struct {
+	recordingMessageService
+	messages []messagepkg.Message
+}
+
+func (s *memoryQueryMessageService) ListActiveSinceBySession(context.Context, string, time.Time) ([]messagepkg.Message, error) {
+	return append([]messagepkg.Message(nil), s.messages...), nil
+}
+
+func (s *memoryQueryMessageService) ListActiveSinceBySessionWithinBytes(context.Context, string, time.Time, int64) ([]messagepkg.Message, error) {
+	return append([]messagepkg.Message(nil), s.messages...), nil
+}
+
+func (s *memoryQueryMessageService) ListActiveSinceWithinBytes(context.Context, string, time.Time, int64) ([]messagepkg.Message, error) {
+	return append([]messagepkg.Message(nil), s.messages...), nil
+}
+
+func (s *memoryQueryMessageService) ListTurnResponseSourcesSinceBySessionWithinBytes(context.Context, string, time.Time, int64) ([]messagepkg.Message, error) {
+	return append([]messagepkg.Message(nil), s.messages...), nil
+}
+
+func (*memoryQueryMessageService) MeasureActiveBySession(context.Context, string, time.Time) (messagepkg.ActiveMessagesMeasure, error) {
+	return messagepkg.ActiveMessagesMeasure{}, nil
+}
+
+func TestMemoryQueryBuilderCombinesRecentUserMessages(t *testing.T) {
+	t.Parallel()
+
+	builder := memoryQueryBuilder{MaxRecentMessages: 2, MaxBytes: 2000, MaxLines: 20, MaxMessageRunes: 200}
+	query := builder.Build(ChatRequest{Query: "What should I pack?"}, []historyfrag.HistoryRecord{
+		{ModelMessage: ModelMessage{Role: "user", Content: newTextContent("I am visiting Berlin next week")}},
+		{ModelMessage: ModelMessage{Role: "assistant", Content: newTextContent("Sounds fun.")}},
+		{ModelMessage: ModelMessage{Role: "user", Content: newTextContent("I prefer tea over coffee")}},
+		{ModelMessage: ModelMessage{Role: "user", Content: newTextContent("What should I pack?")}},
+	})
+
+	if query.Source != "current_query_with_history" {
+		t.Fatalf("Source = %q, want current_query_with_history", query.Source)
+	}
+	if query.RecentMessages != 2 {
+		t.Fatalf("RecentMessages = %d, want 2", query.RecentMessages)
+	}
+	for _, want := range []string{"Current user request:", "What should I pack?", "I am visiting Berlin", "I prefer tea"} {
+		if !strings.Contains(query.Query, want) {
+			t.Fatalf("query missing %q: %s", want, query.Query)
+		}
+	}
+	if strings.Count(query.Query, "What should I pack?") != 1 {
+		t.Fatalf("expected current query to be deduplicated, got: %s", query.Query)
+	}
+}
+
+func TestMemoryQueryBuilderTruncates(t *testing.T) {
+	t.Parallel()
+
+	builder := memoryQueryBuilder{MaxRecentMessages: 1, MaxBytes: 120, MaxLines: 6, MaxMessageRunes: 500}
+	query := builder.Build(ChatRequest{Query: strings.Repeat("current ", 30)}, []historyfrag.HistoryRecord{
+		{ModelMessage: ModelMessage{Role: "user", Content: newTextContent(strings.Repeat("history ", 30))}},
+	})
+
+	if !query.Truncated {
+		t.Fatal("expected query to be marked truncated")
+	}
+	if len(query.Query) > 120 {
+		t.Fatalf("query length = %d, want <= 120: %q", len(query.Query), query.Query)
+	}
+}
+
+func TestMemoryQueryBuilderSkipsEmptyVisibleQuery(t *testing.T) {
+	t.Parallel()
+
+	query := defaultMemoryQueryBuilder().Build(ChatRequest{Query: "   "}, []historyfrag.HistoryRecord{
+		{ModelMessage: ModelMessage{Role: "user", Content: newTextContent("history")}},
+	})
+	if query.Query != "" {
+		t.Fatalf("expected empty query, got %+v", query)
+	}
+}
+
+func TestBuildMemoryQueryRespectsRetryCutoffForRawAndCompactedHistory(t *testing.T) {
+	t.Parallel()
+
+	botID := "00000000-0000-0000-0000-00000000b715"
+	sessionID := "00000000-0000-0000-0000-00000000e715"
+	compactID := "00000000-0000-0000-0000-00000000c715"
+	base := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	prior := persistedHistoryMessage(t, "prior-user", "user", "prior visible context")
+	prior.BotID = botID
+	prior.SessionID = sessionID
+	prior.CreatedAt = base.Add(10 * time.Minute)
+	cutoff := persistedHistoryMessage(t, "cutoff-user", "user", "edited-away request")
+	cutoff.BotID = botID
+	cutoff.SessionID = sessionID
+	cutoff.CreatedAt = base.Add(20 * time.Minute)
+
+	resolver := &Service{
+		messageService: &memoryQueryMessageService{messages: []messagepkg.Message{prior, cutoff}},
+		queries: &recordingCompactionLogQueries{logs: []sqlc.BotHistoryMessageCompact{{
+			ID:            mustPGUUID(t, compactID),
+			BotID:         mustPGUUID(t, botID),
+			SessionID:     mustPGUUID(t, sessionID),
+			Status:        "ok",
+			Summary:       "edited-away compacted context",
+			AnchorStartMs: base.Add(15 * time.Minute).UnixMilli(),
+			AnchorEndMs:   cutoff.CreatedAt.UnixMilli(),
+		}}},
+	}
+	query := resolver.buildMemoryQuery(context.Background(), ChatRequest{
+		BotID:                        botID,
+		ThreadID:                     sessionID,
+		Query:                        "replacement request",
+		HistoryCutoffBeforeMessageID: cutoff.ID,
+	})
+
+	if !strings.Contains(query.Query, "prior visible context") {
+		t.Fatalf("memory query lost pre-cutoff context: %q", query.Query)
+	}
+	for _, excluded := range []string{"edited-away request", "edited-away compacted context"} {
+		if strings.Contains(query.Query, excluded) {
+			t.Fatalf("memory query resurrected %q across retry cutoff: %q", excluded, query.Query)
+		}
+	}
+}
+
+type recentUserQueryService struct {
+	recordingMessageService
+	recent  []messagepkg.Message
+	limit   int32
+	byteCap int64
+	byID    map[string]messagepkg.Message
+}
+
+func (s *recentUserQueryService) ListRecentUserMessagesBySession(_ context.Context, _ string, maxMessages int32, maxBytes int64) ([]messagepkg.Message, error) {
+	s.limit = maxMessages
+	s.byteCap = maxBytes
+	return append([]messagepkg.Message(nil), s.recent...), nil
+}
+
+func (s *recentUserQueryService) GetByIDBySession(_ context.Context, _ string, messageID string) (messagepkg.Message, error) {
+	msg, ok := s.byID[messageID]
+	if !ok {
+		return messagepkg.Message{}, errMemoryQueryTestNotFound
+	}
+	return msg, nil
+}
+
+var errMemoryQueryTestNotFound = errors.New("message not found")
+
+func TestBuildMemoryQueryUsesRecentUserMessages(t *testing.T) {
+	t.Parallel()
+
+	// The store answers newest first, like the SQL projection.
+	service := &recentUserQueryService{recent: []messagepkg.Message{
+		persistedHistoryMessage(t, "recent-2", "user", "I prefer tea over coffee"),
+		persistedHistoryMessage(t, "recent-1", "user", "I am visiting Berlin next week"),
+	}}
+	svc := &Service{messageService: service}
+
+	query := svc.buildMemoryQuery(context.Background(), ChatRequest{
+		Query:    "What should I pack?",
+		ThreadID: "session-1",
+	})
+	if query.Source != "current_query_with_history" {
+		t.Fatalf("Source = %q, want current_query_with_history", query.Source)
+	}
+	for _, want := range []string{"What should I pack?", "I prefer tea", "I am visiting Berlin"} {
+		if !strings.Contains(query.Query, want) {
+			t.Fatalf("query missing %q: %s", want, query.Query)
+		}
+	}
+	if service.limit != defaultMemoryQueryRecentMessages*memoryQueryRecentFetchFactor {
+		t.Fatalf("fetch limit = %d, want %d", service.limit, defaultMemoryQueryRecentMessages*memoryQueryRecentFetchFactor)
+	}
+}
+
+func TestBuildMemoryQueryHonorsHistoryCutoff(t *testing.T) {
+	t.Parallel()
+
+	base := time.Date(2026, 10, 20, 8, 0, 0, 0, time.UTC)
+	oldest := persistedHistoryMessage(t, "recent-1", "user", "before the reset")
+	oldest.CreatedAt = base
+	cutoff := persistedHistoryMessage(t, "recent-2", "user", "the reset point")
+	cutoff.CreatedAt = base.Add(time.Hour)
+	newest := persistedHistoryMessage(t, "recent-3", "user", "after the reset")
+	newest.CreatedAt = base.Add(2 * time.Hour)
+	service := &recentUserQueryService{
+		recent: []messagepkg.Message{newest, cutoff, oldest},
+		byID:   map[string]messagepkg.Message{cutoff.ID: cutoff},
+	}
+	svc := &Service{messageService: service}
+
+	query := svc.buildMemoryQuery(context.Background(), ChatRequest{
+		Query:                        "current question",
+		ThreadID:                     "session-1",
+		HistoryCutoffBeforeMessageID: cutoff.ID,
+	})
+	// filterMessagesBeforeID semantics: only messages strictly before the
+	// cutoff survive.
+	if !strings.Contains(query.Query, "before the reset") {
+		t.Fatalf("cutoff must keep earlier user messages: %s", query.Query)
+	}
+	for _, excluded := range []string{"the reset point", "after the reset"} {
+		if strings.Contains(query.Query, excluded) {
+			t.Fatalf("cutoff must exclude %q: %s", excluded, query.Query)
+		}
+	}
+}

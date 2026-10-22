@@ -3,21 +3,24 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
-	mcpgw "github.com/memohai/memoh/internal/mcp"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
+
+	mcpgw "github.com/felinics/memoh/internal/mcp"
 )
 
 type MCPFederationGateway struct {
-	handler *ContainerdHandler
-	logger  *slog.Logger
-	client  *http.Client
+	handler      *ContainerdHandler
+	logger       *slog.Logger
+	client       *http.Client
+	oauthService *mcpgw.OAuthService
 }
 
 func NewMCPFederationGateway(log *slog.Logger, handler *ContainerdHandler) *MCPFederationGateway {
@@ -33,21 +36,30 @@ func NewMCPFederationGateway(log *slog.Logger, handler *ContainerdHandler) *MCPF
 	}
 }
 
+// SetOAuthService injects the OAuth service for token-based authentication.
+func (g *MCPFederationGateway) SetOAuthService(svc *mcpgw.OAuthService) {
+	g.oauthService = svc
+}
+
+// errMCPUnauthorized reports that the MCP server answered a request of the
+// session with 401 Unauthorized.
+var errMCPUnauthorized = errors.New("mcp server requires authorization")
+
 func (g *MCPFederationGateway) ListHTTPConnectionTools(ctx context.Context, connection mcpgw.Connection) ([]mcpgw.ToolDescriptor, error) {
-	session, err := g.connectStreamableSession(ctx, connection)
+	session, status, err := g.connectStreamableSession(ctx, connection)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = session.Close() }()
 	result, err := session.ListTools(ctx, &sdkmcp.ListToolsParams{})
 	if err != nil {
-		return nil, err
+		return nil, status.annotate(err)
 	}
 	return convertSDKTools(result.Tools), nil
 }
 
 func (g *MCPFederationGateway) CallHTTPConnectionTool(ctx context.Context, connection mcpgw.Connection, toolName string, args map[string]any) (map[string]any, error) {
-	session, err := g.connectStreamableSession(ctx, connection)
+	session, _, err := g.connectStreamableSession(ctx, connection)
 	if err != nil {
 		return nil, err
 	}
@@ -63,20 +75,20 @@ func (g *MCPFederationGateway) CallHTTPConnectionTool(ctx context.Context, conne
 }
 
 func (g *MCPFederationGateway) ListSSEConnectionTools(ctx context.Context, connection mcpgw.Connection) ([]mcpgw.ToolDescriptor, error) {
-	session, err := g.connectSSESession(ctx, connection)
+	session, status, err := g.connectSSESession(ctx, connection)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = session.Close() }()
 	result, err := session.ListTools(ctx, &sdkmcp.ListToolsParams{})
 	if err != nil {
-		return nil, err
+		return nil, status.annotate(err)
 	}
 	return convertSDKTools(result.Tools), nil
 }
 
 func (g *MCPFederationGateway) CallSSEConnectionTool(ctx context.Context, connection mcpgw.Connection, toolName string, args map[string]any) (map[string]any, error) {
-	session, err := g.connectSSESession(ctx, connection)
+	session, _, err := g.connectSSESession(ctx, connection)
 	if err != nil {
 		return nil, err
 	}
@@ -91,27 +103,32 @@ func (g *MCPFederationGateway) CallSSEConnectionTool(ctx context.Context, connec
 	return wrapSDKToolResult(result)
 }
 
-func (g *MCPFederationGateway) connectStreamableSession(ctx context.Context, connection mcpgw.Connection) (*sdkmcp.ClientSession, error) {
+func (g *MCPFederationGateway) connectStreamableSession(ctx context.Context, connection mcpgw.Connection) (*sdkmcp.ClientSession, *responseStatusRecorder, error) {
 	url := strings.TrimSpace(anyToString(connection.Config["url"]))
 	if url == "" {
-		return nil, fmt.Errorf("http mcp url is required")
+		return nil, nil, errors.New("http mcp url is required")
 	}
 	client := sdkmcp.NewClient(&sdkmcp.Implementation{
 		Name:    "memoh-federation-client",
 		Version: "v1",
 	}, nil)
+	httpClient, status := g.connectionHTTPClient(ctx, connection)
 	transport := &sdkmcp.StreamableClientTransport{
 		Endpoint:   url,
-		HTTPClient: g.connectionHTTPClient(connection),
+		HTTPClient: httpClient,
 		MaxRetries: -1,
 	}
-	return client.Connect(ctx, transport, nil)
+	session, err := client.Connect(ctx, transport, nil)
+	if err != nil {
+		return nil, nil, status.annotate(err)
+	}
+	return session, status, nil
 }
 
-func (g *MCPFederationGateway) connectSSESession(ctx context.Context, connection mcpgw.Connection) (*sdkmcp.ClientSession, error) {
+func (g *MCPFederationGateway) connectSSESession(ctx context.Context, connection mcpgw.Connection) (*sdkmcp.ClientSession, *responseStatusRecorder, error) {
 	endpoints := resolveSSEEndpointCandidates(connection.Config)
 	if len(endpoints) == 0 {
-		return nil, fmt.Errorf("sse mcp url is required")
+		return nil, nil, errors.New("sse mcp url is required")
 	}
 	var lastErr error
 	for _, endpoint := range endpoints {
@@ -119,20 +136,21 @@ func (g *MCPFederationGateway) connectSSESession(ctx context.Context, connection
 			Name:    "memoh-federation-client",
 			Version: "v1",
 		}, nil)
+		httpClient, status := g.connectionHTTPClient(ctx, connection)
 		transport := &sdkmcp.SSEClientTransport{
 			Endpoint:   endpoint,
-			HTTPClient: g.connectionHTTPClient(connection),
+			HTTPClient: httpClient,
 		}
 		session, err := client.Connect(ctx, transport, nil)
 		if err == nil {
-			return session, nil
+			return session, status, nil
 		}
-		lastErr = err
+		lastErr = status.annotate(err)
 	}
 	if lastErr == nil {
-		lastErr = fmt.Errorf("no sse endpoint candidate available")
+		lastErr = errors.New("no sse endpoint candidate available")
 	}
-	return nil, fmt.Errorf("connect sse mcp failed: %w", lastErr)
+	return nil, nil, fmt.Errorf("connect sse mcp failed: %w", lastErr)
 }
 
 func resolveSSEEndpointCandidates(config map[string]any) []string {
@@ -186,28 +204,47 @@ func resolveSSEEndpointCandidates(config map[string]any) []string {
 	return out
 }
 
-func (g *MCPFederationGateway) connectionHTTPClient(connection mcpgw.Connection) *http.Client {
+// connectionHTTPClient returns the client for one MCP session and the
+// recorder of the statuses its responses carried. The go-sdk transports report
+// a failed response only as its status text, so the status is taken here.
+func (g *MCPFederationGateway) connectionHTTPClient(ctx context.Context, connection mcpgw.Connection) (*http.Client, *responseStatusRecorder) {
 	base := g.client
 	if base == nil {
 		base = &http.Client{Timeout: 30 * time.Second}
 	}
 	headers := normalizeHeaderMap(connection.Config["headers"])
-	if len(headers) == 0 {
-		return base
+
+	if strings.TrimSpace(connection.AuthType) == "oauth" && g.oauthService != nil {
+		token, err := g.oauthService.GetValidToken(ctx, connection.ID)
+		if err != nil {
+			g.logger.WarnContext(ctx, "failed to get OAuth token for connection",
+				slog.String("connection_id", connection.ID),
+				slog.Any("error", err))
+		} else if token != "" {
+			if headers == nil {
+				headers = map[string]string{}
+			}
+			headers["Authorization"] = "Bearer " + token
+		}
 	}
+
 	transport := base.Transport
 	if transport == nil {
 		transport = http.DefaultTransport
 	}
+	if len(headers) > 0 {
+		transport = &staticHeaderRoundTripper{
+			next:    transport,
+			headers: headers,
+		}
+	}
+	status := &responseStatusRecorder{next: transport}
 	return &http.Client{
 		Timeout:       base.Timeout,
 		CheckRedirect: base.CheckRedirect,
 		Jar:           base.Jar,
-		Transport: &staticHeaderRoundTripper{
-			next:    transport,
-			headers: headers,
-		},
-	}
+		Transport:     status,
+	}, status
 }
 
 func (g *MCPFederationGateway) ListStdioConnectionTools(ctx context.Context, botID string, connection mcpgw.Connection) ([]mcpgw.ToolDescriptor, error) {
@@ -215,17 +252,13 @@ func (g *MCPFederationGateway) ListStdioConnectionTools(ctx context.Context, bot
 	if err != nil {
 		return nil, err
 	}
-	defer sess.closeWithError(io.EOF)
+	defer sess.Close()
 
-	payload, err := sess.call(ctx, mcpgw.JSONRPCRequest{
-		JSONRPC: "2.0",
-		ID:      mcpgw.RawStringID("federated-stdio-tools-list"),
-		Method:  "tools/list",
-	})
+	result, err := sess.session.ListTools(ctx, &sdkmcp.ListToolsParams{})
 	if err != nil {
-		return nil, err
+		return nil, sess.enrichError(err)
 	}
-	return parseGatewayToolsListPayload(payload)
+	return convertSDKTools(result.Tools), nil
 }
 
 func (g *MCPFederationGateway) CallStdioConnectionTool(ctx context.Context, botID string, connection mcpgw.Connection, toolName string, args map[string]any) (map[string]any, error) {
@@ -233,41 +266,33 @@ func (g *MCPFederationGateway) CallStdioConnectionTool(ctx context.Context, botI
 	if err != nil {
 		return nil, err
 	}
-	defer sess.closeWithError(io.EOF)
+	defer sess.Close()
 
-	params, err := json.Marshal(map[string]any{
-		"name":      toolName,
-		"arguments": args,
+	result, err := sess.session.CallTool(ctx, &sdkmcp.CallToolParams{
+		Name:      strings.TrimSpace(toolName),
+		Arguments: args,
 	})
 	if err != nil {
-		return nil, err
+		return nil, sess.enrichError(err)
 	}
-	return sess.call(ctx, mcpgw.JSONRPCRequest{
-		JSONRPC: "2.0",
-		ID:      mcpgw.RawStringID("federated-stdio-tools-call"),
-		Method:  "tools/call",
-		Params:  params,
-	})
+	return wrapSDKToolResult(result)
 }
 
-func (g *MCPFederationGateway) startStdioConnectionSession(ctx context.Context, botID string, connection mcpgw.Connection) (*mcpSession, error) {
+func (g *MCPFederationGateway) startStdioConnectionSession(ctx context.Context, botID string, connection mcpgw.Connection) (*mcpStdioClient, error) {
 	if g.handler == nil {
-		return nil, fmt.Errorf("containerd handler not configured")
+		return nil, errors.New("containerd handler not configured")
 	}
-	containerID, err := g.handler.botContainerID(ctx, botID)
+	if err := g.handler.manager.EnsureRunning(ctx, botID); err != nil {
+		return nil, err
+	}
+	containerID, err := g.handler.manager.ContainerID(ctx, botID)
 	if err != nil {
-		return nil, err
-	}
-	if err := g.handler.validateMCPContainer(ctx, containerID, botID); err != nil {
-		return nil, err
-	}
-	if err := g.handler.ensureContainerAndTask(ctx, containerID, botID); err != nil {
 		return nil, err
 	}
 
 	command := strings.TrimSpace(anyToString(connection.Config["command"]))
 	if command == "" {
-		return nil, fmt.Errorf("stdio mcp command is required")
+		return nil, errors.New("stdio mcp command is required")
 	}
 	request := MCPStdioRequest{
 		Name:    strings.TrimSpace(connection.Name),
@@ -276,46 +301,9 @@ func (g *MCPFederationGateway) startStdioConnectionSession(ctx context.Context, 
 		Env:     normalizeStringMap(connection.Config["env"]),
 		Cwd:     strings.TrimSpace(anyToString(connection.Config["cwd"])),
 	}
-	return g.handler.startContainerdMCPCommandSession(ctx, containerID, request)
-}
-
-func parseGatewayToolsListPayload(payload map[string]any) ([]mcpgw.ToolDescriptor, error) {
-	if err := mcpgw.PayloadError(payload); err != nil {
-		return nil, err
-	}
-	result, ok := payload["result"].(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("invalid tools/list result")
-	}
-	rawTools, ok := result["tools"].([]any)
-	if !ok {
-		return nil, fmt.Errorf("invalid tools/list tools field")
-	}
-	tools := make([]mcpgw.ToolDescriptor, 0, len(rawTools))
-	for _, rawTool := range rawTools {
-		item, ok := rawTool.(map[string]any)
-		if !ok {
-			continue
-		}
-		name := strings.TrimSpace(anyToString(item["name"]))
-		if name == "" {
-			continue
-		}
-		description := strings.TrimSpace(anyToString(item["description"]))
-		inputSchema, _ := item["inputSchema"].(map[string]any)
-		if inputSchema == nil {
-			inputSchema = map[string]any{
-				"type":       "object",
-				"properties": map[string]any{},
-			}
-		}
-		tools = append(tools, mcpgw.ToolDescriptor{
-			Name:        name,
-			Description: description,
-			InputSchema: inputSchema,
-		})
-	}
-	return tools, nil
+	// Federation sessions are short-lived and unregistered — no onClose. Memoh
+	// is the real client here, so the handshake uses the default identity.
+	return g.handler.startContainerdMCPCommandSession(ctx, botID, containerID, request, nil, defaultStdioSDKClient())
 }
 
 func convertSDKTools(items []*sdkmcp.Tool) []mcpgw.ToolDescriptor {
@@ -454,6 +442,29 @@ func anyToString(v any) string {
 	default:
 		return fmt.Sprintf("%v", v)
 	}
+}
+
+// responseStatusRecorder records whether any response of an MCP session was
+// 401 Unauthorized.
+type responseStatusRecorder struct {
+	next         http.RoundTripper
+	unauthorized atomic.Bool
+}
+
+func (r *responseStatusRecorder) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := r.next.RoundTrip(req)
+	if err == nil && resp.StatusCode == http.StatusUnauthorized {
+		r.unauthorized.Store(true)
+	}
+	return resp, err
+}
+
+// annotate marks err with errMCPUnauthorized when the session saw a 401.
+func (r *responseStatusRecorder) annotate(err error) error {
+	if err == nil || r == nil || !r.unauthorized.Load() {
+		return err
+	}
+	return errors.Join(errMCPUnauthorized, err)
 }
 
 type staticHeaderRoundTripper struct {

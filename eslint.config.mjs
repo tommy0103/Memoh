@@ -6,9 +6,11 @@ import vue from 'eslint-plugin-vue'
 export default [
   ...tseslint.configs.recommended,
   ...vue.configs['flat/recommended'],
-  { ignores: ['**/node_modules/**', '**/dist/**', 'packages/sdk/src/**'] },
+  // internal/**/protocolref holds vendored protocol reference snapshots
+  // (pinned verbatim; a freshness test diffs them against upstream).
+  { ignores: ['**/node_modules/**', '**/dist/**', '**/out/**', '**/cache/**', '**/target/**', '**/.toolkit/**', 'packages/sdk/src/**', 'internal/**/protocolref/**'] },
   {
-    files: ['packages/**/*.{js,jsx,ts,tsx}', 'agent/**/*.{js,jsx,ts,tsx}'],
+    files: ['packages/**/*.{js,jsx,ts,tsx}', 'apps/**/*.{js,jsx,ts,tsx}'],
     languageOptions: {
       parserOptions: {
         ecmaVersion: 2022,
@@ -19,10 +21,29 @@ export default [
     rules: {
       quotes: ['error', 'single'],
       semi: ['error', 'never'],
+      '@typescript-eslint/no-unused-vars': ['error', {
+        argsIgnorePattern: '^_',
+        varsIgnorePattern: '^_',
+        destructuredArrayIgnorePattern: '^_',
+      }],
     },
   },
   {
-    files: ['packages/**/*.vue', 'agent/**/*.vue'],
+    files: ['apps/web/src/store/**/*.ts'],
+    ignores: [
+      'apps/web/src/store/workspace-tabs.ts',
+      'apps/web/src/store/**/*.test.ts',
+    ],
+    rules: {
+      'max-lines': ['error', {
+        max: 600,
+        skipBlankLines: true,
+        skipComments: true,
+      }],
+    },
+  },
+  {
+    files: ['packages/**/*.vue', 'apps/**/*.vue'],
     languageOptions: {
       parser: vueParser,
       parserOptions: {
@@ -38,6 +59,13 @@ export default [
       quotes: ['error', 'single'],
       semi: ['error', 'never'],
       'vue/multi-word-component-names': 'off',
+      'vue/require-default-prop': 'off',
+      'vue/no-required-prop-with-default':'error',
+      '@typescript-eslint/no-unused-vars': ['error', {
+        argsIgnorePattern: '^_',
+        varsIgnorePattern: '^_',
+        destructuredArrayIgnorePattern: '^_',
+      }],
     },
   },
 ]

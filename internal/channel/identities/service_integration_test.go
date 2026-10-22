@@ -1,5 +1,4 @@
 //go:build ignore
-// +build ignore
 
 package identities_test
 
@@ -11,14 +10,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
-
-	"github.com/memohai/memoh/internal/channel/identities"
-	"github.com/memohai/memoh/internal/db/sqlc"
+	"github.com/felinics/memoh/internal/channel/identities"
+	dbpkg "github.com/felinics/memoh/internal/db"
+	"github.com/felinics/memoh/internal/db/postgres/sqlc"
+	postgresstore "github.com/felinics/memoh/internal/db/postgres/store"
+	dbstore "github.com/felinics/memoh/internal/db/store"
 )
 
-func setupIntegrationTest(t *testing.T) (*identities.Service, *sqlc.Queries, func()) {
+func setupIntegrationTest(t *testing.T) (*identities.Service, dbstore.Queries, func()) {
 	t.Helper()
 
 	dsn := os.Getenv("TEST_POSTGRES_DSN")
@@ -27,7 +26,7 @@ func setupIntegrationTest(t *testing.T) (*identities.Service, *sqlc.Queries, fun
 	}
 
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn)
+	pool, err := dbpkg.OpenPostgresDSN(ctx, dsn)
 	if err != nil {
 		t.Skipf("skip integration test: cannot connect to database: %v", err)
 	}
@@ -36,7 +35,7 @@ func setupIntegrationTest(t *testing.T) (*identities.Service, *sqlc.Queries, fun
 		t.Skipf("skip integration test: database ping failed: %v", err)
 	}
 
-	queries := sqlc.New(pool)
+	queries := postgresstore.NewQueries(sqlc.New(pool))
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	svc := identities.NewService(logger, queries)
 
@@ -60,37 +59,5 @@ func TestIntegrationResolveByChannelIdentityStability(t *testing.T) {
 	}
 	if first.ID != second.ID {
 		t.Fatalf("expected stable channelIdentity id, got %s and %s", first.ID, second.ID)
-	}
-}
-
-func TestIntegrationLinkChannelIdentityToUser(t *testing.T) {
-	svc, queries, cleanup := setupIntegrationTest(t)
-	defer cleanup()
-
-	ctx := context.Background()
-	key := fmt.Sprintf("bind_%d", time.Now().UnixNano())
-	channelIdentity, err := svc.ResolveByChannelIdentity(ctx, "telegram", key, "tg-user", nil)
-	if err != nil {
-		t.Fatalf("resolve channelIdentity failed: %v", err)
-	}
-
-	user, err := queries.CreateUser(ctx, sqlc.CreateUserParams{
-		IsActive: true,
-		Metadata: []byte("{}"),
-	})
-	if err != nil {
-		t.Fatalf("create user failed: %v", err)
-	}
-	userID := uuid.UUID(user.ID.Bytes).String()
-
-	if err := svc.LinkChannelIdentityToUser(ctx, channelIdentity.ID, userID); err != nil {
-		t.Fatalf("link channelIdentity to user failed: %v", err)
-	}
-	linkedUserID, err := svc.GetLinkedUserID(ctx, channelIdentity.ID)
-	if err != nil {
-		t.Fatalf("get linked user failed: %v", err)
-	}
-	if linkedUserID != userID {
-		t.Fatalf("expected linked user=%s, got %s", userID, linkedUserID)
 	}
 }

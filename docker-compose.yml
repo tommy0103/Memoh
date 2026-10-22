@@ -9,7 +9,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-memoh123}
     volumes:
       - postgres_data:/var/lib/postgresql
-      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+      - /etc/localtime:/etc/localtime:ro
     expose:
       - "5432"
     healthcheck:
@@ -21,16 +21,20 @@ services:
     networks:
       - memoh-network
 
-  qdrant:
-    image: qdrant/qdrant:latest
-    container_name: memoh-qdrant
+  pgvector:
+    image: pgvector/pgvector:pg18
+    container_name: memoh-pgvector
+    environment:
+      POSTGRES_DB: memoh_vector
+      POSTGRES_USER: memoh
+      POSTGRES_PASSWORD: ${PGVECTOR_PASSWORD:-${POSTGRES_PASSWORD:-memoh123}}
     volumes:
-      - qdrant_data:/qdrant/storage
+      - pgvector_data:/var/lib/postgresql
+      - /etc/localtime:/etc/localtime:ro
     expose:
-      - "6333"
-      - "6334"
+      - "5432"
     healthcheck:
-      test: ["CMD-SHELL", "timeout 10s bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      test: ["CMD-SHELL", "pg_isready -U memoh -d memoh_vector"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -38,84 +42,188 @@ services:
     networks:
       - memoh-network
 
-  containerd:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.containerd
-    container_name: memoh-containerd
-    privileged: true
-    pid: host
+  migrate:
+    image: memohai/server:latest
+    container_name: memoh-migrate
+    entrypoint: ["/app/memoh-server", "migrate", "up"]
     volumes:
-      - containerd_sock:/run/containerd
-      - containerd_data:/var/lib/containerd
+      - ${MEMOH_CONFIG:-./config.toml}:/app/config.toml:ro
       - memoh_data:/opt/memoh/data
-    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
     networks:
       - memoh-network
 
   server:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.server
-      args:
-        - VERSION=${MEMOH_VERSION:-dev}
-        - COMMIT_HASH=${MEMOH_COMMIT:-unknown}
-        - BUILD_TIME=${MEMOH_BUILD_TIME:-unknown}
+    stop_grace_period: 45s
+    image: memohai/server:latest
     container_name: memoh-server
+    privileged: true
     pid: host
+    # Explicit memory ceiling (CM-PRC-001): the Go runtime backs off at
+    # GOMEMLIMIT instead of running into the container's OOM kill. Keep
+    # GOMEMLIMIT at roughly 85% of mem_limit when overriding either.
+    mem_limit: ${MEMOH_SERVER_MEMORY_LIMIT:-8g}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      GOMEMLIMIT: "${MEMOH_SERVER_GOMEMLIMIT:-7GiB}"
+      # Proxy: use host.docker.internal for localhost proxies, e.g.
+      #   HTTP_PROXY=http://host.docker.internal:7890 docker compose up -d
+      HTTP_PROXY: "${HTTP_PROXY:-${http_proxy:-}}"
+      HTTPS_PROXY: "${HTTPS_PROXY:-${https_proxy:-}}"
+      NO_PROXY: "${NO_PROXY:-127.0.0.1,localhost},postgres,pgvector,server,channel,web,migrate,webhook-tunnel,connect-it,memoh-postgres,memoh-pgvector,memoh-server,memoh-channel,memoh-web,memoh-migrate,memoh-webhook-tunnel,memoh-connect-it"
+      http_proxy: "${http_proxy:-${HTTP_PROXY:-}}"
+      https_proxy: "${https_proxy:-${HTTPS_PROXY:-}}"
+      no_proxy: "${no_proxy:-${NO_PROXY:-127.0.0.1,localhost}},postgres,pgvector,server,channel,web,migrate,webhook-tunnel,connect-it,memoh-postgres,memoh-pgvector,memoh-server,memoh-channel,memoh-web,memoh-migrate,memoh-webhook-tunnel,memoh-connect-it"
+      MEMOH_INTERNAL_RPC_SHARED_SECRET: "${MEMOH_INTERNAL_RPC_SHARED_SECRET:?MEMOH_INTERNAL_RPC_SHARED_SECRET is required}"
+      MEMOH_AGENT_CREDENTIALS_ENCRYPTION_KEY: "${MEMOH_AGENT_CREDENTIALS_ENCRYPTION_KEY:-}"
+      MEMOH_INTERNAL_RPC_SERVER_TARGET: "server:9090"
+      MEMOH_INTERNAL_RPC_CHANNEL_TARGET: "channel:9091"
+      MEMOH_CONNECT_IT_BASE_URL: "${MEMOH_CONNECT_IT_BASE_URL:-}"
+      MEMOH_CONNECT_IT_API_TOKEN: "${MEMOH_CONNECT_IT_API_TOKEN:-}"
+      MEMOH_DISPLAY_WEBRTC_UDP_PORT: "${MEMOH_DISPLAY_WEBRTC_UDP_PORT:-${MEMOH_DISPLAY_WEBRTC_UDP_PORT_MIN:-30000}}"
     volumes:
-      - ${MEMOH_CONFIG:-./docker/config/config.docker.toml}:/app/config.toml:ro
-      - containerd_sock:/run/containerd
+      - ${MEMOH_CONFIG:-./config.toml}:/app/config.toml:ro
+      - ./conf/providers:/app/conf/providers:ro
       - containerd_data:/var/lib/containerd
       - server_cni_state:/var/lib/cni
       - memoh_data:/opt/memoh/data
-    cap_add:
-      - SYS_ADMIN
-      - NET_ADMIN
-    security_opt:
-      - seccomp:unconfined
-      - apparmor:unconfined
+      # Expose host CDI specs to the nested containerd used for bot workspaces.
+      - /etc/cdi:/etc/cdi:ro
+      - /var/run/cdi:/var/run/cdi:ro
+      - /etc/localtime:/etc/localtime:ro
     ports:
       - "8080:8080"
+      - "1455:8080"
+      - "${MEMOH_DISPLAY_WEBRTC_UDP_PORT:-${MEMOH_DISPLAY_WEBRTC_UDP_PORT_MIN:-30000}}:${MEMOH_DISPLAY_WEBRTC_UDP_PORT:-${MEMOH_DISPLAY_WEBRTC_UDP_PORT_MIN:-30000}}/udp"
+    expose:
+      - "9090"
     depends_on:
-      postgres:
-        condition: service_healthy
-      qdrant:
-        condition: service_healthy
-      containerd:
+      migrate:
+        condition: service_completed_successfully
+      pgvector:
         condition: service_healthy
     restart: unless-stopped
     networks:
       - memoh-network
 
-  agent:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.agent
-    container_name: memoh-agent
+  channel:
+    image: memohai/server:latest
+    container_name: memoh-channel
+    entrypoint: ["/app/memoh-channel", "serve"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      HTTP_PROXY: "${HTTP_PROXY:-${http_proxy:-}}"
+      HTTPS_PROXY: "${HTTPS_PROXY:-${https_proxy:-}}"
+      NO_PROXY: "${NO_PROXY:-127.0.0.1,localhost},postgres,server,channel,webhook-tunnel,memoh-postgres,memoh-server,memoh-channel,memoh-webhook-tunnel"
+      http_proxy: "${http_proxy:-${HTTP_PROXY:-}}"
+      https_proxy: "${https_proxy:-${HTTPS_PROXY:-}}"
+      no_proxy: "${no_proxy:-${NO_PROXY:-127.0.0.1,localhost}},postgres,server,channel,webhook-tunnel,memoh-postgres,memoh-server,memoh-channel,memoh-webhook-tunnel"
+      MEMOH_INTERNAL_RPC_SHARED_SECRET: "${MEMOH_INTERNAL_RPC_SHARED_SECRET:?MEMOH_INTERNAL_RPC_SHARED_SECRET is required}"
+      MEMOH_INTERNAL_RPC_SERVER_TARGET: "server:9090"
+      MEMOH_INTERNAL_RPC_CHANNEL_TARGET: "channel:9091"
+      MEMOH_WEBHOOK_TUNNEL_MODE: "${MEMOH_WEBHOOK_TUNNEL_MODE:-}"
+      MEMOH_WEBHOOK_PUBLIC_BASE_URL: "${MEMOH_WEBHOOK_PUBLIC_BASE_URL:-}"
+      MEMOH_WEBHOOK_TUNNEL_LISTEN_ADDR: ":18734"
+      MEMOH_WEBHOOK_TUNNEL_METRICS_URL: "http://webhook-tunnel:18735"
     volumes:
-      - ${MEMOH_CONFIG:-./docker/config/config.docker.toml}:/config.toml:ro
-    ports:
-      - "8081:8081"
+      - ${MEMOH_CONFIG:-./config.toml}:/app/config.toml:ro
+      - /etc/localtime:/etc/localtime:ro
+    expose:
+      - "8081"
+      - "9091"
+      - "18734"
     depends_on:
-      - server
+      migrate:
+        condition: service_completed_successfully
+      # Wait for the server so inbound platform messages arriving in the
+      # startup window do not fail their turn RPC.
+      server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8081/health"]
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - memoh-network
+
+  webhook-tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: memoh-webhook-tunnel
+    command: tunnel --no-autoupdate --url http://channel:18734 --metrics 0.0.0.0:18735
+    profiles: [webhook-tunnel]
+    environment:
+      HTTP_PROXY: "${HTTP_PROXY:-${http_proxy:-}}"
+      HTTPS_PROXY: "${HTTPS_PROXY:-${https_proxy:-}}"
+      NO_PROXY: "${NO_PROXY:-127.0.0.1,localhost},channel,memoh-channel"
+      http_proxy: "${http_proxy:-${HTTP_PROXY:-}}"
+      https_proxy: "${https_proxy:-${HTTPS_PROXY:-}}"
+      no_proxy: "${no_proxy:-${NO_PROXY:-127.0.0.1,localhost}},channel,memoh-channel"
+    depends_on:
+      - channel
+    expose:
+      - "18735"
+    restart: unless-stopped
+    networks:
+      - memoh-network
+
+  # Optional co-hosted Connect-It (enable with --profile connectors). It owns
+  # and migrates its own connect_it schema inside the shared memoh database;
+  # Memoh reaches it over HTTP only. The bootstrap API token is seeded by
+  # Connect-It at startup and presented by the Memoh server as its bearer
+  # token — the install script generates and persists all of these values.
+  connect-it:
+    image: "${MEMOH_CONNECT_IT_IMAGE:-ghcr.io/felinics/connect-it:0.3.1}"
+    container_name: memoh-connect-it
+    profiles: [connectors]
+    environment:
+      DATABASE_URL: "postgres://memoh:${POSTGRES_PASSWORD:-memoh123}@postgres:5432/memoh?sslmode=disable&search_path=connect_it"
+      CONNECT_IT_SECRET_KEY: "${MEMOH_CONNECT_IT_SECRET_KEY:-}"
+      COOKIE_SECRET: "${MEMOH_CONNECT_IT_COOKIE_SECRET:-}"
+      CONNECT_IT_ADMIN_PASSWORD: "${MEMOH_CONNECT_IT_ADMIN_PASSWORD:-}"
+      CONNECT_IT_BOOTSTRAP_API_TOKEN: "${MEMOH_CONNECT_IT_API_TOKEN:-}"
+      CONNECT_IT_BASE_URL: "${MEMOH_CONNECT_IT_PUBLIC_BASE_URL:-http://localhost:${MEMOH_CONNECT_IT_PORT:-8421}}"
+      HTTP_PROXY: "${HTTP_PROXY:-${http_proxy:-}}"
+      HTTPS_PROXY: "${HTTPS_PROXY:-${https_proxy:-}}"
+      NO_PROXY: "${NO_PROXY:-127.0.0.1,localhost},postgres,server,connect-it,memoh-postgres,memoh-server,memoh-connect-it"
+      http_proxy: "${http_proxy:-${HTTP_PROXY:-}}"
+      https_proxy: "${https_proxy:-${HTTPS_PROXY:-}}"
+      no_proxy: "${no_proxy:-${NO_PROXY:-127.0.0.1,localhost}},postgres,server,connect-it,memoh-postgres,memoh-server,memoh-connect-it"
+    ports:
+      - "${MEMOH_CONNECT_IT_PORT:-8421}:8421"
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
     networks:
       - memoh-network
 
   web:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.web
-      args:
-        - VITE_API_URL=${VITE_API_URL:-/api}
-        - VITE_AGENT_URL=${VITE_AGENT_URL:-/agent}
+    image: memohai/web:latest
     container_name: memoh-web
+    environment:
+      MEMOH_SERVER_UPSTREAM: ${MEMOH_SERVER_UPSTREAM:-memoh-server:8080}
+      MEMOH_CHANNEL_UPSTREAM: ${MEMOH_CHANNEL_UPSTREAM:-memoh-channel:8081}
     ports:
       - "8082:8082"
+      # HTTPS + HTTP/2：h2 多路复用可避免多标签页的 SSE 长连接占满浏览器对单
+      # origin 的 ~6 条 HTTP/1.1 连接、导致页面卡死（#822）。取消下面两处注释
+      # 并放入证书后自动启用（自签 / mkcert / Let's Encrypt 均可）。
+      # - "8443:8443"
+    # volumes:
+    #   - ./certs:/etc/nginx/certs:ro   # 需包含 server.crt 与 server.key
     depends_on:
-      - server
-      - agent
+      server:
+        condition: service_healthy
+      channel:
+        condition: service_healthy
     restart: unless-stopped
     networks:
       - memoh-network
@@ -123,9 +231,7 @@ services:
 volumes:
   postgres_data:
     driver: local
-  qdrant_data:
-    driver: local
-  containerd_sock:
+  pgvector_data:
     driver: local
   containerd_data:
     driver: local

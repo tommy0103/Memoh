@@ -2,24 +2,23 @@ package channelchecker
 
 import (
 	"context"
-	"io"
 	"log/slog"
 	"testing"
 	"time"
 
-	"github.com/memohai/memoh/internal/channel"
+	"github.com/felinics/memoh/internal/channel"
 )
 
 type fakeConnectionObserver struct {
 	items []channel.ConnectionStatus
 }
 
-func (f *fakeConnectionObserver) ConnectionStatusesByBot(botID string) []channel.ConnectionStatus {
+func (f *fakeConnectionObserver) ConnectionStatusesByBot(_ string) []channel.ConnectionStatus {
 	return f.items
 }
 
 func newTestLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+	return slog.New(slog.DiscardHandler)
 }
 
 func TestCheckerListChecks(t *testing.T) {

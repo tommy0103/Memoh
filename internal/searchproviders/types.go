@@ -5,7 +5,18 @@ import "time"
 type ProviderName string
 
 const (
-	ProviderBrave ProviderName = "brave"
+	ProviderBrave      ProviderName = "brave"
+	ProviderBing       ProviderName = "bing"
+	ProviderGoogle     ProviderName = "google"
+	ProviderTavily     ProviderName = "tavily"
+	ProviderSogou      ProviderName = "sogou"
+	ProviderSerper     ProviderName = "serper"
+	ProviderSearXNG    ProviderName = "searxng"
+	ProviderJina       ProviderName = "jina"
+	ProviderExa        ProviderName = "exa"
+	ProviderBocha      ProviderName = "bocha"
+	ProviderDuckDuckGo ProviderName = "duckduckgo"
+	ProviderYandex     ProviderName = "yandex"
 )
 
 type ProviderConfigSchema struct {
@@ -37,6 +48,7 @@ type UpdateRequest struct {
 	Name     *string        `json:"name,omitempty"`
 	Provider *ProviderName  `json:"provider,omitempty"`
 	Config   map[string]any `json:"config,omitempty"`
+	Enable   *bool          `json:"enable,omitempty"`
 }
 
 type GetResponse struct {
@@ -44,6 +56,7 @@ type GetResponse struct {
 	Name      string         `json:"name"`
 	Provider  string         `json:"provider"`
 	Config    map[string]any `json:"config,omitempty"`
+	Enable    bool           `json:"enable"`
 	CreatedAt time.Time      `json:"created_at"`
 	UpdatedAt time.Time      `json:"updated_at"`
 }

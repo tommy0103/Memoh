@@ -7,8 +7,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/memohai/memoh/internal/channel"
-	"github.com/memohai/memoh/internal/healthcheck"
+	"github.com/felinics/memoh/internal/channel"
+	"github.com/felinics/memoh/internal/healthcheck"
 )
 
 const (
@@ -40,9 +40,6 @@ func NewChecker(log *slog.Logger, observer ConnectionObserver) *Checker {
 
 // ListChecks evaluates channel connection statuses for a bot.
 func (c *Checker) ListChecks(ctx context.Context, botID string) []healthcheck.CheckResult {
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	// Connection observer is context-free; best effort early cancellation guard.
 	if err := ctx.Err(); err != nil {
 		return []healthcheck.CheckResult{}
@@ -53,7 +50,7 @@ func (c *Checker) ListChecks(ctx context.Context, botID string) []healthcheck.Ch
 	}
 	if c.observer == nil {
 		if c.logger != nil {
-			c.logger.Warn(
+			c.logger.WarnContext(ctx,
 				"channel healthcheck dependency is unavailable",
 				slog.String("bot_id", botID),
 			)

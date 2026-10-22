@@ -85,4 +85,10 @@ func TestNormalizeTarget(t *testing.T) {
 	if got := normalizeTarget("@alice"); got != "@alice" {
 		t.Fatalf("unexpected normalized target: %s", got)
 	}
+	if got := normalizeTarget("123456789"); got != "123456789" {
+		t.Fatalf("positive chat ID mangled: %s", got)
+	}
+	if got := normalizeTarget("-1002280927535"); got != "-1002280927535" {
+		t.Fatalf("negative supergroup chat ID mangled: %s", got)
+	}
 }

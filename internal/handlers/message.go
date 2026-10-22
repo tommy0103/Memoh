@@ -1,59 +1,98 @@
 package handlers
 
 import (
-	"bufio"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/labstack/echo/v4"
 
-	"github.com/memohai/memoh/internal/accounts"
-	"github.com/memohai/memoh/internal/bots"
-	"github.com/memohai/memoh/internal/channel/identities"
-	"github.com/memohai/memoh/internal/conversation"
-	"github.com/memohai/memoh/internal/conversation/flow"
-	"github.com/memohai/memoh/internal/media"
-	messagepkg "github.com/memohai/memoh/internal/message"
-	messageevent "github.com/memohai/memoh/internal/message/event"
+	"github.com/felinics/memoh/internal/accounts"
+	"github.com/felinics/memoh/internal/agent/background"
+	toolapproval "github.com/felinics/memoh/internal/agent/decision/approval"
+	userinput "github.com/felinics/memoh/internal/agent/decision/input"
+	sessionruntime "github.com/felinics/memoh/internal/agent/runtime/session"
+	chatview "github.com/felinics/memoh/internal/agent/view"
+	"github.com/felinics/memoh/internal/apperror"
+	"github.com/felinics/memoh/internal/bots"
+	messageevent "github.com/felinics/memoh/internal/chat/event"
+	messagepkg "github.com/felinics/memoh/internal/chat/message"
+	session "github.com/felinics/memoh/internal/chat/thread"
+	"github.com/felinics/memoh/internal/errs"
+	"github.com/felinics/memoh/internal/httpx"
+	"github.com/felinics/memoh/internal/media"
 )
 
 // MessageHandler handles bot-scoped messaging endpoints.
 type MessageHandler struct {
-	runner              flow.Runner
-	conversationService conversation.Accessor
-	messageService      messagepkg.Service
-	messageEvents       messageevent.Subscriber
-	mediaService        *media.Service
-	botService          *bots.Service
-	accountService      *accounts.Service
-	channelIdentitySvc  *identities.Service
-	logger              *slog.Logger
+	messageService                messagepkg.Service
+	sessionService                *session.Service
+	runtimeResets                 messageRuntimeResetService
+	messageEvents                 messageevent.Subscriber
+	messagePublisher              messageevent.Publisher
+	activityInvalidationSupported bool
+	mediaService                  *media.Service
+	botService                    *bots.Service
+	accountService                *accounts.Service
+	toolApproval                  *toolapproval.Service
+	userInput                     *userinput.Service
+	bgManager                     *background.Manager
+	projectionCache               messageProjectionCache
+	compactionActivity            interface{ ActiveSessions(string) []string }
+	logger                        *slog.Logger
+}
+
+type messageProjectionCache interface {
+	DropSession(sessionID string)
+	DropAll()
+}
+
+// runtimeResetService is intentionally a narrow handler-owned port. Clearing the
+// canonical timeline must also discard any process-local ACP conversation;
+// otherwise the next turn would silently repopulate history from the old
+// native session even though the UI was cleared.
+type messageRuntimeResetService interface {
+	BeginSessionHistoryReset(ctx context.Context, botID, sessionID string) (resetCtx context.Context, release func(), err error)
+	BeginBotHistoryReset(ctx context.Context, botID string) (resetCtx context.Context, release func(), err error)
+}
+
+// UIMessageListResponse is the normalized, authoritative session history read by Web.
+type UIMessageListResponse struct {
+	Items []chatview.UITurn `json:"items" validate:"required"`
+}
+
+// UILocateMessageResponse is a normalized history window around one external message.
+type UILocateMessageResponse struct {
+	Items                   []chatview.UITurn `json:"items" validate:"required"`
+	TargetID                string            `json:"target_id" validate:"required" format:"uuid"`
+	TargetExternalMessageID string            `json:"target_external_message_id" validate:"required"`
 }
 
 // NewMessageHandler creates a MessageHandler.
-func NewMessageHandler(log *slog.Logger, runner flow.Runner, conversationService conversation.Accessor, messageService messagepkg.Service, botService *bots.Service, accountService *accounts.Service, channelIdentitySvc *identities.Service, eventSubscribers ...messageevent.Subscriber) *MessageHandler {
+func NewMessageHandler(log *slog.Logger, messageService messagepkg.Service, sessionService *session.Service, botService *bots.Service, accountService *accounts.Service, eventSubscribers ...messageevent.Subscriber) *MessageHandler {
 	var messageEvents messageevent.Subscriber
 	if len(eventSubscribers) > 0 {
 		messageEvents = eventSubscribers[0]
 	}
+	messagePublisher, _ := messageEvents.(messageevent.Publisher)
 	return &MessageHandler{
-		runner:              runner,
-		conversationService: conversationService,
-		messageService:      messageService,
-		messageEvents:       messageEvents,
-		botService:          botService,
-		accountService:      accountService,
-		channelIdentitySvc:  channelIdentitySvc,
-		logger:              log.With(slog.String("handler", "conversation")),
+		messageService:   messageService,
+		sessionService:   sessionService,
+		messageEvents:    messageEvents,
+		messagePublisher: messagePublisher,
+		botService:       botService,
+		accountService:   accountService,
+		logger:           log.With(slog.String("handler", "conversation")),
 	}
 }
 
@@ -62,197 +101,68 @@ func (h *MessageHandler) SetMediaService(svc *media.Service) {
 	h.mediaService = svc
 }
 
+func (h *MessageHandler) SetProjectionCache(cache messageProjectionCache) {
+	h.projectionCache = cache
+}
+
+func (h *MessageHandler) SetCompactionActivity(activity interface{ ActiveSessions(string) []string }) {
+	h.compactionActivity = activity
+}
+
+func (h *MessageHandler) SetSessionActivityInvalidationSupported(supported bool) {
+	h.activityInvalidationSupported = supported
+}
+
+func (h *MessageHandler) SetToolApprovalService(svc *toolapproval.Service) {
+	h.toolApproval = svc
+}
+
+func (h *MessageHandler) SetUserInputService(svc *userinput.Service) {
+	h.userInput = svc
+}
+
+func (h *MessageHandler) SetBackgroundManager(mgr *background.Manager) {
+	h.bgManager = mgr
+}
+
+func (h *MessageHandler) SetRuntimeResetService(resets messageRuntimeResetService) {
+	h.runtimeResets = resets
+}
+
 // Register registers all conversation routes.
 func (h *MessageHandler) Register(e *echo.Echo) {
-	// Bot-scoped message container (single shared history per bot).
 	botGroup := e.Group("/bots/:bot_id")
-	botGroup.POST("/messages", h.SendMessage)
-	botGroup.POST("/messages/stream", h.StreamMessage)
 	botGroup.GET("/messages", h.ListMessages)
-	botGroup.GET("/messages/events", h.StreamMessageEvents)
+	botGroup.GET("/messages/locate", h.LocateMessage)
 	botGroup.DELETE("/messages", h.DeleteMessages)
-	botGroup.GET("/media/:asset_id", h.ServeMedia)
+	botGroup.GET("/media/:content_hash", h.ServeMedia)
+
+	// Bot-wide activity SSE, carrying only lightweight session metadata (no
+	// message bodies) for sidebar live-sort. A session's own contents are read
+	// through the session runtime over the chat WebSocket, which is what lets
+	// every subscriber of a session agree on what it has seen.
+	botGroup.GET("/sessions/events", h.StreamSessionsActivityEvents)
 }
 
 // --- Messages ---
 
-// SendMessage sends a synchronous conversation message.
-func (h *MessageHandler) SendMessage(c echo.Context) error {
-	channelIdentityID, err := h.requireChannelIdentityID(c)
-	if err != nil {
+func writeSSEData(writer io.Writer, flusher http.Flusher, payload string) error {
+	// SSE frames are line-oriented; fold CR/LF to avoid frame injection.
+	safePayload := strings.NewReplacer("\r", "\\r", "\n", "\\n").Replace(payload)
+	if _, err := io.WriteString(writer, "data: "); err != nil {
 		return err
 	}
-	botID := strings.TrimSpace(c.Param("bot_id"))
-	if botID == "" {
-		return echo.NewHTTPError(http.StatusBadRequest, "bot id is required")
-	}
-	if _, err := h.authorizeBotAccess(c.Request().Context(), channelIdentityID, botID); err != nil {
+	if _, err := io.WriteString(writer, safePayload); err != nil { //nolint:gosec // G705: SSE body is plain text and CR/LF are escaped above
 		return err
 	}
-	if err := h.requireParticipant(c.Request().Context(), botID, channelIdentityID); err != nil {
-		return err
-	}
-
-	var req conversation.ChatRequest
-	if err := c.Bind(&req); err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
-	}
-	if strings.TrimSpace(req.Query) == "" && len(req.Attachments) == 0 {
-		return echo.NewHTTPError(http.StatusBadRequest, "query or attachments is required")
-	}
-	req.BotID = botID
-	req.ChatID = botID
-	req.Token = c.Request().Header.Get("Authorization")
-	req.UserID = channelIdentityID
-	req.SourceChannelIdentityID = channelIdentityID
-	if strings.TrimSpace(req.CurrentChannel) == "" {
-		req.CurrentChannel = "web"
-	}
-	if strings.TrimSpace(req.ConversationType) == "" {
-		req.ConversationType = "direct"
-	}
-	if len(req.Channels) == 0 {
-		req.Channels = []string{req.CurrentChannel}
-	}
-	channelIdentityID = h.resolveWebChannelIdentity(c.Request().Context(), channelIdentityID, &req)
-	if req.Attachments, err = h.ingestInlineAttachments(c.Request().Context(), botID, req.Attachments); err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
-	}
-
-	if h.runner == nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "conversation runner not configured")
-	}
-	resp, err := h.runner.Chat(c.Request().Context(), req)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-	}
-	return c.JSON(http.StatusOK, resp)
-}
-
-// StreamMessage sends a streaming conversation message.
-func (h *MessageHandler) StreamMessage(c echo.Context) error {
-	channelIdentityID, err := h.requireChannelIdentityID(c)
-	if err != nil {
-		return err
-	}
-	botID := strings.TrimSpace(c.Param("bot_id"))
-	if botID == "" {
-		return echo.NewHTTPError(http.StatusBadRequest, "bot id is required")
-	}
-	if _, err := h.authorizeBotAccess(c.Request().Context(), channelIdentityID, botID); err != nil {
-		return err
-	}
-	if err := h.requireParticipant(c.Request().Context(), botID, channelIdentityID); err != nil {
-		return err
-	}
-
-	var req conversation.ChatRequest
-	if err := c.Bind(&req); err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
-	}
-	if strings.TrimSpace(req.Query) == "" && len(req.Attachments) == 0 {
-		return echo.NewHTTPError(http.StatusBadRequest, "query or attachments is required")
-	}
-	req.BotID = botID
-	req.ChatID = botID
-	req.Token = c.Request().Header.Get("Authorization")
-	req.UserID = channelIdentityID
-	req.SourceChannelIdentityID = channelIdentityID
-	if strings.TrimSpace(req.CurrentChannel) == "" {
-		req.CurrentChannel = "web"
-	}
-	if strings.TrimSpace(req.ConversationType) == "" {
-		req.ConversationType = "direct"
-	}
-	if len(req.Channels) == 0 {
-		req.Channels = []string{req.CurrentChannel}
-	}
-	channelIdentityID = h.resolveWebChannelIdentity(c.Request().Context(), channelIdentityID, &req)
-	if req.Attachments, err = h.ingestInlineAttachments(c.Request().Context(), botID, req.Attachments); err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
-	}
-
-	if h.runner == nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "conversation runner not configured")
-	}
-	c.Response().Header().Set(echo.HeaderContentType, "text/event-stream")
-	c.Response().Header().Set(echo.HeaderCacheControl, "no-cache")
-	c.Response().Header().Set(echo.HeaderConnection, "keep-alive")
-	c.Response().WriteHeader(http.StatusOK)
-
-	chunkChan, errChan := h.runner.StreamChat(c.Request().Context(), req)
-	flusher, ok := c.Response().Writer.(http.Flusher)
-	if !ok {
-		return echo.NewHTTPError(http.StatusInternalServerError, "streaming not supported")
-	}
-	writer := bufio.NewWriter(c.Response().Writer)
-	processingState := "started"
-	if err := writeSSEJSON(writer, flusher, map[string]string{"type": "processing_started"}); err != nil {
-		return nil
-	}
-
-	for {
-		select {
-		case chunk, ok := <-chunkChan:
-			if !ok {
-				if processingState == "started" {
-					processingState = "completed"
-					if err := writeSSEJSON(writer, flusher, map[string]string{"type": "processing_completed"}); err != nil {
-						return nil
-					}
-				}
-				if err := writeSSEData(writer, flusher, "[DONE]"); err != nil {
-					return nil
-				}
-				return nil
-			}
-			if processingState == "started" {
-				processingState = "completed"
-				if err := writeSSEJSON(writer, flusher, map[string]string{"type": "processing_completed"}); err != nil {
-					return nil
-				}
-			}
-			if err := writeSSEData(writer, flusher, string(chunk)); err != nil {
-				return nil
-			}
-		case err := <-errChan:
-			if err != nil {
-				h.logger.Error("conversation stream failed", slog.Any("error", err))
-				if processingState == "started" {
-					processingState = "failed"
-					if writeErr := writeSSEJSON(writer, flusher, map[string]string{
-						"type":  "processing_failed",
-						"error": err.Error(),
-					}); writeErr != nil {
-						h.logger.Warn("write SSE processing_failed event failed", slog.Any("error", writeErr))
-					}
-				}
-				errData := map[string]string{
-					"type":    "error",
-					"error":   err.Error(),
-					"message": err.Error(),
-				}
-				if writeErr := writeSSEJSON(writer, flusher, errData); writeErr != nil {
-					return nil
-				}
-				return nil
-			}
-		}
-	}
-}
-
-func writeSSEData(writer *bufio.Writer, flusher http.Flusher, payload string) error {
-	if _, err := writer.WriteString(fmt.Sprintf("data: %s\n\n", payload)); err != nil {
-		return err
-	}
-	if err := writer.Flush(); err != nil {
+	if _, err := io.WriteString(writer, "\n\n"); err != nil {
 		return err
 	}
 	flusher.Flush()
 	return nil
 }
 
-func writeSSEJSON(writer *bufio.Writer, flusher http.Flusher, payload any) error {
+func writeSSEJSON(writer io.Writer, flusher http.Flusher, payload any) error {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -260,139 +170,35 @@ func writeSSEJSON(writer *bufio.Writer, flusher http.Flusher, payload any) error
 	return writeSSEData(writer, flusher, string(data))
 }
 
-func (h *MessageHandler) ingestInlineAttachments(ctx context.Context, botID string, attachments []conversation.ChatAttachment) ([]conversation.ChatAttachment, error) {
-	if len(attachments) == 0 || h.mediaService == nil {
-		return attachments, nil
-	}
-	result := make([]conversation.ChatAttachment, 0, len(attachments))
-	for _, att := range attachments {
-		item := att
-		if strings.TrimSpace(item.AssetID) != "" || strings.TrimSpace(item.Base64) == "" {
-			result = append(result, item)
-			continue
-		}
-		mediaType := mapAttachmentMediaType(item.Type)
-		maxBytes := media.MaxAssetBytes
-		raw, err := decodeAttachmentBase64(item.Base64, maxBytes)
-		if err != nil {
-			return nil, fmt.Errorf("invalid attachment base64: %w", err)
-		}
-		asset, err := h.mediaService.Ingest(ctx, media.IngestInput{
-			BotID:        botID,
-			MediaType:    mediaType,
-			Mime:         strings.TrimSpace(item.Mime),
-			OriginalName: strings.TrimSpace(item.Name),
-			Metadata:     item.Metadata,
-			Reader:       raw,
-			MaxBytes:     maxBytes,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("ingest attachment failed: %w", err)
-		}
-		item.AssetID = asset.ID
-		item.Path = h.mediaService.AccessPath(asset)
-		mime := strings.TrimSpace(item.Mime)
-		if mime == "" {
-			mime = strings.TrimSpace(asset.Mime)
-		}
-		item.Base64 = normalizeBase64DataURL(item.Base64, mime)
-		if strings.TrimSpace(item.Mime) == "" {
-			item.Mime = asset.Mime
-		}
-		result = append(result, item)
-	}
-	return result, nil
-}
-
-func decodeAttachmentBase64(input string, maxBytes int64) (io.Reader, error) {
-	value := strings.TrimSpace(input)
-	if value == "" {
-		return nil, fmt.Errorf("base64 payload is empty")
-	}
-	if strings.HasPrefix(strings.ToLower(value), "data:") {
-		if idx := strings.Index(value, ","); idx >= 0 {
-			value = value[idx+1:]
-		}
-	}
-	decoder := base64.NewDecoder(base64.StdEncoding, strings.NewReader(value))
-	return io.LimitReader(decoder, maxBytes+1), nil
-}
-
-func normalizeBase64DataURL(input, mime string) string {
-	value := strings.TrimSpace(input)
-	if value == "" {
-		return ""
-	}
-	if strings.HasPrefix(strings.ToLower(value), "data:") {
-		return value
-	}
-	mime = strings.TrimSpace(mime)
-	if mime == "" {
-		mime = "application/octet-stream"
-	}
-	return "data:" + mime + ";base64," + value
-}
-
-func mapAttachmentMediaType(t string) media.MediaType {
-	switch strings.ToLower(strings.TrimSpace(t)) {
-	case "image", "gif":
-		return media.MediaTypeImage
-	case "audio", "voice":
-		return media.MediaTypeAudio
-	case "video":
-		return media.MediaTypeVideo
-	default:
-		return media.MediaTypeFile
-	}
-}
-
-func parseSinceParam(raw string) (time.Time, bool, error) {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return time.Time{}, false, nil
-	}
-	layouts := []string{time.RFC3339Nano, time.RFC3339}
-	for _, layout := range layouts {
-		parsed, err := time.Parse(layout, trimmed)
-		if err == nil {
-			return parsed.UTC(), true, nil
-		}
-	}
-	if epochMillis, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
-		return time.UnixMilli(epochMillis).UTC(), true, nil
-	}
-	return time.Time{}, false, fmt.Errorf("invalid since parameter")
-}
-
 // ListMessages godoc
-// @Summary List bot history messages
-// @Description List messages for a bot history with optional pagination
+// @Summary List session history messages
+// @Description List messages for one session with optional pagination
 // @Tags messages
 // @Produce json
-// @Param bot_id path string true "Bot ID"
-// @Param limit query int false "Limit"
+// @Param bot_id path string true "Bot ID" format(uuid)
+// @Param session_id query string true "Session ID" format(uuid)
+// @Param limit query int false "Limit" default(30) minimum(1) maximum(100)
 // @Param before query string false "Before"
-// @Success 200 {object} map[string][]messagepkg.Message
-// @Failure 400 {object} ErrorResponse
-// @Failure 403 {object} ErrorResponse
-// @Failure 500 {object} ErrorResponse
-// @Router /bots/{bot_id}/messages [get]
+// @Param before_message_id query string false "Message ID cursor before which to page" format(uuid)
+// @Success 200 {object} UIMessageListResponse
+// @Failure 400 {object} server.Problem
+// @Failure 403 {object} server.Problem
+// @Failure 404 {object} server.Problem
+// @Failure 500 {object} server.Problem
+// @Router /bots/{bot_id}/messages [get].
 func (h *MessageHandler) ListMessages(c echo.Context) error {
 	channelIdentityID, err := h.requireChannelIdentityID(c)
 	if err != nil {
 		return err
 	}
-	botID := strings.TrimSpace(c.Param("bot_id"))
-	if botID == "" {
-		return echo.NewHTTPError(http.StatusBadRequest, "bot id is required")
-	}
-	if _, err := h.authorizeBotAccess(c.Request().Context(), channelIdentityID, botID); err != nil {
+	botID, err := httpx.RequiredParam(c, "bot_id")
+	if err != nil {
 		return err
 	}
-	if err := h.requireReadable(c.Request().Context(), botID, channelIdentityID); err != nil {
+	sessionID, err := httpx.RequiredQuery(c, "session_id")
+	if err != nil {
 		return err
 	}
-
 	if h.messageService == nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "message service not configured")
 	}
@@ -404,21 +210,384 @@ func (h *MessageHandler) ListMessages(c echo.Context) error {
 		}
 	}
 
-	before, hasBefore := parseBeforeParam(c.QueryParam("before"))
-
-	var messages []messagepkg.Message
-	if hasBefore {
-		messages, err = h.messageService.ListBefore(c.Request().Context(), botID, before, limit)
-	} else {
-		messages, err = h.messageService.ListLatest(c.Request().Context(), botID, limit)
-		if err == nil {
-			reverseMessages(messages)
+	beforeMessageID := strings.TrimSpace(c.QueryParam("before_message_id"))
+	if beforeMessageID != "" {
+		if _, err := uuid.Parse(beforeMessageID); err != nil {
+			return apperror.FieldInvalid("before_message_id", err)
 		}
 	}
+	before, hasBefore := parseBeforeParam(c.QueryParam("before"))
+
+	bot, _, sess, err := h.authorizeMessageSession(c, channelIdentityID, botID, sessionID)
 	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		return err
 	}
-	return c.JSON(http.StatusOK, map[string]any{"items": messages})
+	botID = bot.ID
+
+	var messages []messagepkg.Message
+	switch {
+	case beforeMessageID != "":
+		messages, err = h.messageService.ListBeforeMessageBySession(c.Request().Context(), sessionID, beforeMessageID, limit)
+	case hasBefore:
+		// ListBeforeBySession already returns oldest-first (its converter
+		// reverses the DESC DB rows). Do NOT reverse again: the before page
+		// and the turn-head extension both depend on monotonic ASC input.
+		messages, err = h.messageService.ListBeforeBySession(c.Request().Context(), sessionID, before, limit)
+	default:
+		messages, err = h.listLatestUIPageBySession(c.Request().Context(), sessionID, limit)
+	}
+	if err != nil {
+		return errs.Wrap(err, "list messages")
+	}
+	// Each page is converted independently, so a page that begins mid assistant
+	// turn (its earlier rows on the previous page) would render one reply as
+	// several turns/action bars. Extend the head back to a real turn boundary
+	// so a turn is never split across pages.
+	if len(messages) > 0 {
+		messages = h.extendToUITurnHead(c.Request().Context(), sessionID, messages, limit)
+	}
+	items := chatview.ConvertSessionMessagesToUITurns(messages, sess.RuntimeType, sess.RuntimeMetadata)
+	h.decorateUITurns(c.Request().Context(), botID, sessionID, sess, items)
+	return c.JSON(http.StatusOK, UIMessageListResponse{Items: items})
+}
+
+type latestUIMessageLister interface {
+	ListLatestUIBySession(ctx context.Context, sessionID string, limit int32) ([]messagepkg.Message, error)
+}
+
+func (h *MessageHandler) listLatestUIBySession(ctx context.Context, sessionID string, limit int32) ([]messagepkg.Message, error) {
+	if svc, ok := h.messageService.(latestUIMessageLister); ok {
+		return svc.ListLatestUIBySession(ctx, sessionID, limit)
+	}
+	return h.messageService.ListLatestBySession(ctx, sessionID, limit)
+}
+
+func (h *MessageHandler) listLatestUIPageBySession(ctx context.Context, sessionID string, limit int32) ([]messagepkg.Message, error) {
+	const lookbackRows = int32(50)
+	fetchLimit := limit
+	if fetchLimit > 0 {
+		fetchLimit += lookbackRows
+	}
+	messages, err := h.listLatestUIBySession(ctx, sessionID, fetchLimit)
+	if err != nil {
+		return nil, err
+	}
+	reverseMessages(messages)
+	if limit <= 0 || len(messages) <= int(limit) {
+		return messages, nil
+	}
+
+	start := len(messages) - int(limit)
+	turnID := strings.TrimSpace(messages[start].TurnID)
+	for start > 0 && turnID != "" && strings.TrimSpace(messages[start-1].TurnID) == turnID {
+		start--
+	}
+	return messages[start:], nil
+}
+
+// LocateMessage godoc
+// @Summary Locate a bot history message
+// @Description Locate a session message by external message ID and return nearby UI turns
+// @Tags messages
+// @Produce json
+// @Param bot_id path string true "Bot ID" format(uuid)
+// @Param session_id query string true "Session ID" format(uuid)
+// @Param external_message_id query string true "External message ID"
+// @Param before query int false "Messages before target" default(30) minimum(0) maximum(100)
+// @Param after query int false "Messages after target" default(30) minimum(0) maximum(100)
+// @Success 200 {object} UILocateMessageResponse
+// @Failure 400 {object} server.Problem
+// @Failure 403 {object} server.Problem
+// @Failure 404 {object} server.Problem
+// @Failure 500 {object} server.Problem
+// @Router /bots/{bot_id}/messages/locate [get].
+func (h *MessageHandler) LocateMessage(c echo.Context) error {
+	channelIdentityID, err := h.requireChannelIdentityID(c)
+	if err != nil {
+		return err
+	}
+	botID, err := httpx.RequiredParam(c, "bot_id")
+	if err != nil {
+		return err
+	}
+	if h.messageService == nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "message service not configured")
+	}
+
+	sessionID, err := httpx.RequiredQuery(c, "session_id")
+	if err != nil {
+		return err
+	}
+	bot, _, sess, err := h.authorizeMessageSession(c, channelIdentityID, botID, sessionID)
+	if err != nil {
+		return err
+	}
+	botID = bot.ID
+	externalMessageID := strings.TrimSpace(c.QueryParam("external_message_id"))
+	if externalMessageID == "" {
+		externalMessageID = strings.TrimSpace(c.QueryParam("message_id"))
+	}
+	if externalMessageID == "" {
+		return apperror.FieldRequired("external_message_id")
+	}
+
+	before := parseBoundedInt32(c.QueryParam("before"), 30, 0, 100)
+	after := parseBoundedInt32(c.QueryParam("after"), 30, 0, 100)
+	located, err := h.messageService.LocateByExternalIDBySession(c.Request().Context(), sessionID, externalMessageID, before, after)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return apperror.Wrap(apperror.CodeMessageNotFound, err, nil)
+		}
+		return errs.Wrap(err, "get message")
+	}
+
+	items := chatview.ConvertSessionMessagesToUITurns(located.Messages, sess.RuntimeType, sess.RuntimeMetadata)
+	h.decorateUITurns(c.Request().Context(), botID, sessionID, sess, items)
+	return c.JSON(http.StatusOK, UILocateMessageResponse{
+		Items:                   items,
+		TargetID:                located.TargetID,
+		TargetExternalMessageID: externalMessageID,
+	})
+}
+
+func parseBoundedInt32(raw string, fallback int32, minValue int32, maxValue int32) int32 {
+	value := fallback
+	if s := strings.TrimSpace(raw); s != "" {
+		if n, err := strconv.ParseInt(s, 10, 32); err == nil {
+			value = int32(n)
+		}
+	}
+	if value < minValue {
+		return minValue
+	}
+	if value > maxValue {
+		return maxValue
+	}
+	return value
+}
+
+func (h *MessageHandler) backgroundTaskSnapshots(botID, sessionID string) []chatview.UIBackgroundTask {
+	if h.bgManager == nil {
+		return nil
+	}
+	snapshots := h.bgManager.ListSnapshotsForSession(botID, sessionID)
+	tasks := make([]chatview.UIBackgroundTask, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		status := string(snapshot.Status)
+		stalled := snapshot.Stalled
+		if stalled {
+			status = "stalled"
+		}
+		label := snapshot.Command
+		if label == "" {
+			label = snapshot.Description
+		}
+		tasks = append(tasks, chatview.UIBackgroundTask{
+			TaskID:         snapshot.TaskID,
+			Status:         status,
+			Command:        label,
+			AgentID:        snapshot.AgentID,
+			AgentSessionID: snapshot.AgentSessionID,
+			OutputFile:     snapshot.OutputFile,
+			ExitCode:       snapshot.ExitCode,
+			Duration:       snapshot.Duration.Round(time.Millisecond).String(),
+			OutputTail:     firstNonEmptyString(snapshot.OutputTail, snapshot.AgentReport, snapshot.AgentError),
+			Stalled:        stalled,
+		})
+	}
+	return tasks
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func (h *MessageHandler) toolApprovalCanApproveFn(sess session.Thread) func(toolapproval.Request) bool {
+	defaultFn := func(req toolapproval.Request) bool {
+		return toolapproval.CanApprove(req.Status)
+	}
+	if h == nil || h.toolApproval == nil || !session.UsesDecisionWaiter(sess) {
+		return defaultFn
+	}
+	return h.toolApproval.CanRespond
+}
+
+func (h *MessageHandler) userInputCanRespondFn(sess session.Thread) func(userinput.Request) bool {
+	// nil keeps mergeUserInputs' native default: a pending row can respond.
+	if h == nil || h.userInput == nil || !session.UsesDecisionWaiter(sess) {
+		return nil
+	}
+	return h.userInput.CanRespond
+}
+
+func (h *MessageHandler) decorateUITurns(ctx context.Context, botID, sessionID string, sess session.Thread, items []chatview.UITurn) {
+	if len(items) == 0 {
+		return
+	}
+	if h.bgManager != nil {
+		chatview.ApplyBackgroundTaskSnapshots(items, h.backgroundTaskSnapshots(botID, sessionID))
+	}
+	toolCallIDs := toolCallIDsFromUITurns(items)
+	if len(toolCallIDs) == 0 {
+		return
+	}
+	var wg sync.WaitGroup
+	var approvals []toolapproval.Request
+	var requests []userinput.Request
+	if h.toolApproval != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if rows, err := h.toolApproval.ListBySessionToolCalls(ctx, botID, sessionID, toolCallIDs); err == nil {
+				approvals = rows
+			}
+		}()
+	}
+	if h.userInput != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if rows, err := h.userInput.ListBySessionToolCalls(ctx, botID, sessionID, toolCallIDs); err == nil {
+				requests = rows
+			}
+		}()
+	}
+	wg.Wait()
+	if len(approvals) > 0 {
+		mergeToolApprovals(items, approvals, h.toolApprovalCanApproveFn(sess))
+	}
+	if len(requests) > 0 {
+		mergeUserInputs(items, requests, h.userInputCanRespondFn(sess))
+	}
+}
+
+func toolCallIDsFromUITurns(turns []chatview.UITurn) []string {
+	var seen map[string]struct{}
+	var ids []string
+	for _, turn := range turns {
+		for _, msg := range turn.Messages {
+			if msg.Type != chatview.UIMessageTool {
+				continue
+			}
+			id := strings.TrimSpace(msg.ToolCallID)
+			if id == "" {
+				continue
+			}
+			if seen == nil {
+				seen = make(map[string]struct{}, 4)
+			}
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+func mergeToolApprovals(turns []chatview.UITurn, approvals []toolapproval.Request, canApproveFn func(toolapproval.Request) bool) {
+	if len(turns) == 0 || len(approvals) == 0 {
+		return
+	}
+	if canApproveFn == nil {
+		canApproveFn = func(req toolapproval.Request) bool {
+			return toolapproval.CanApprove(req.Status)
+		}
+	}
+	byCallID := make(map[string]toolapproval.Request, len(approvals))
+	for _, approval := range approvals {
+		if callID := strings.TrimSpace(approval.ToolCallID); callID != "" {
+			byCallID[callID] = approval
+		}
+	}
+	for turnIdx := range turns {
+		if turns[turnIdx].Role != "assistant" {
+			continue
+		}
+		for msgIdx := range turns[turnIdx].Messages {
+			msg := &turns[turnIdx].Messages[msgIdx]
+			if msg.Type != chatview.UIMessageTool {
+				continue
+			}
+			approval, ok := byCallID[strings.TrimSpace(msg.ToolCallID)]
+			if !ok {
+				continue
+			}
+			running := false
+			msg.Running = &running
+			msg.Approval = &chatview.UIToolApproval{
+				ApprovalID:       approval.ID,
+				ShortID:          approval.ShortID,
+				Status:           approval.Status,
+				DecisionReason:   approval.DecisionReason,
+				CanApprove:       canApproveFn(approval),
+				Options:          uiToolApprovalOptions(approval.Options),
+				SelectedOptionID: approval.SelectedOptionID,
+			}
+		}
+	}
+}
+
+func uiToolApprovalOptions(options []toolapproval.PermissionOption) []chatview.UIToolApprovalOption {
+	if len(options) == 0 {
+		return nil
+	}
+	converted := make([]chatview.UIToolApprovalOption, 0, len(options))
+	for _, option := range options {
+		converted = append(converted, chatview.UIToolApprovalOption{
+			ID:   option.ID,
+			Name: option.Name,
+			Kind: option.Kind,
+		})
+	}
+	return converted
+}
+
+func mergeUserInputs(turns []chatview.UITurn, requests []userinput.Request, canRespondFn func(userinput.Request) bool) {
+	if len(turns) == 0 || len(requests) == 0 {
+		return
+	}
+	byCallID := make(map[string]userinput.Request, len(requests))
+	for _, req := range requests {
+		if callID := strings.TrimSpace(req.ToolCallID); callID != "" {
+			byCallID[callID] = req
+		}
+	}
+	for turnIdx := range turns {
+		if turns[turnIdx].Role != "assistant" {
+			continue
+		}
+		for msgIdx := range turns[turnIdx].Messages {
+			msg := &turns[turnIdx].Messages[msgIdx]
+			if msg.Type != chatview.UIMessageTool {
+				continue
+			}
+			req, ok := byCallID[strings.TrimSpace(msg.ToolCallID)]
+			if !ok {
+				continue
+			}
+			running := false
+			msg.Running = &running
+			canRespond := req.Status == userinput.StatusPending
+			if canRespondFn != nil {
+				canRespond = canRespondFn(req)
+			}
+			msg.UserInput = &chatview.UIUserInput{
+				UserInputID: req.ID,
+				ShortID:     req.ShortID,
+				Status:      req.Status,
+				Questions:   req.UIPayload.Questions,
+				Answers:     userinput.AnswersFromResult(req.Result),
+				CanRespond:  canRespond,
+			}
+		}
+	}
 }
 
 func parseBeforeParam(s string) (time.Time, bool) {
@@ -444,270 +613,279 @@ func reverseMessages(m []messagepkg.Message) {
 	}
 }
 
-// StreamMessageEvents streams bot-scoped message events to clients.
-func (h *MessageHandler) StreamMessageEvents(c echo.Context) error {
-	channelIdentityID, err := h.requireChannelIdentityID(c)
-	if err != nil {
-		return err
+// extendToUITurnHead prepends older rows with the same authoritative turn_id.
+// A turn is the unit of an action bar, so a fixed-size page must not start in
+// the middle of one. The extension budget keeps one pathologically long turn
+// from turning a small UI page into a multi-thousand-row response.
+func (h *MessageHandler) extendToUITurnHead(ctx context.Context, sessionID string, messages []messagepkg.Message, limit int32) []messagepkg.Message {
+	const batch = int32(50)
+	maxRows := uiTurnHeadExtensionLimit(len(messages), limit)
+	if len(messages) == 0 {
+		return messages
 	}
-	botID := strings.TrimSpace(c.Param("bot_id"))
-	if botID == "" {
-		return echo.NewHTTPError(http.StatusBadRequest, "bot id is required")
+	headTurnID := strings.TrimSpace(messages[0].TurnID)
+	if headTurnID == "" {
+		return messages
 	}
-	if _, err := h.authorizeBotAccess(c.Request().Context(), channelIdentityID, botID); err != nil {
-		return err
-	}
-	if err := h.requireReadable(c.Request().Context(), botID, channelIdentityID); err != nil {
-		return err
-	}
-	if h.messageService == nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "message service not configured")
-	}
-	if h.messageEvents == nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "message events not configured")
-	}
-
-	since, hasSince, err := parseSinceParam(c.QueryParam("since"))
-	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
-	}
-
-	c.Response().Header().Set(echo.HeaderContentType, "text/event-stream")
-	c.Response().Header().Set(echo.HeaderCacheControl, "no-cache")
-	c.Response().Header().Set(echo.HeaderConnection, "keep-alive")
-	c.Response().WriteHeader(http.StatusOK)
-
-	flusher, ok := c.Response().Writer.(http.Flusher)
-	if !ok {
-		return echo.NewHTTPError(http.StatusInternalServerError, "streaming not supported")
-	}
-	writer := bufio.NewWriter(c.Response().Writer)
-
-	sentMessageIDs := map[string]struct{}{}
-	writeCreatedEvent := func(message messagepkg.Message) error {
-		msgID := strings.TrimSpace(message.ID)
-		if msgID != "" {
-			if _, exists := sentMessageIDs[msgID]; exists {
-				return nil
-			}
-			sentMessageIDs[msgID] = struct{}{}
+	// messages is oldest-first (ASC). The cursor is the oldest row on the
+	// current page. Only the matching suffix of an older batch belongs to the
+	// same turn; rows before it belong to earlier turns and are not pulled in.
+	for len(messages) < maxRows {
+		older, err := h.messageService.ListBeforeMessageBySession(ctx, sessionID, messages[0].ID, batch)
+		if err != nil || len(older) == 0 {
+			break
 		}
-		return writeSSEJSON(writer, flusher, map[string]any{
-			"type":    string(messageevent.EventTypeMessageCreated),
-			"bot_id":  botID,
-			"message": message,
-		})
-	}
-
-	_, stream, cancel := h.messageEvents.Subscribe(botID, 128)
-	defer cancel()
-
-	if hasSince {
-		backlog, err := h.messageService.ListSince(c.Request().Context(), botID, since)
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		fetched := len(older)
+		sameTurnStart := len(older)
+		for sameTurnStart > 0 && strings.TrimSpace(older[sameTurnStart-1].TurnID) == headTurnID {
+			sameTurnStart--
 		}
-		for _, message := range backlog {
-			if err := writeCreatedEvent(message); err != nil {
-				return nil
-			}
+		older = older[sameTurnStart:]
+		if len(older) == 0 {
+			break
+		}
+		if overflow := len(messages) + len(older) - maxRows; overflow > 0 {
+			older = older[overflow:]
+		}
+		if len(older) == 0 {
+			break
+		}
+		messages = append(older, messages...)
+		if sameTurnStart > 0 || fetched < int(batch) {
+			break // reached the start of the session
 		}
 	}
-
-	heartbeatTicker := time.NewTicker(20 * time.Second)
-	defer heartbeatTicker.Stop()
-
-	for {
-		select {
-		case <-c.Request().Context().Done():
-			return nil
-		case <-heartbeatTicker.C:
-			if err := writeSSEJSON(writer, flusher, map[string]any{"type": "ping"}); err != nil {
-				return nil
-			}
-		case event, ok := <-stream:
-			if !ok {
-				return nil
-			}
-			if strings.TrimSpace(event.BotID) != botID {
-				continue
-			}
-			if event.Type != messageevent.EventTypeMessageCreated {
-				continue
-			}
-			if len(event.Data) == 0 {
-				continue
-			}
-			var message messagepkg.Message
-			if err := json.Unmarshal(event.Data, &message); err != nil {
-				h.logger.Warn("decode message event failed", slog.Any("error", err))
-				continue
-			}
-			if err := writeCreatedEvent(message); err != nil {
-				return nil
-			}
-		}
-	}
+	return messages
 }
 
-// DeleteMessages clears all persisted bot-level history messages.
+func uiTurnHeadExtensionLimit(currentRows int, limit int32) int {
+	const maxExtendedRows = 200
+	pageRows := int(limit)
+	if pageRows <= 0 {
+		pageRows = currentRows
+	}
+	if pageRows < currentRows {
+		pageRows = currentRows
+	}
+	maxRows := pageRows * 4
+	if minRows := pageRows + 50; maxRows < minRows {
+		maxRows = minRows
+	}
+	if maxRows > maxExtendedRows {
+		maxRows = maxExtendedRows
+	}
+	if maxRows < currentRows {
+		return currentRows
+	}
+	return maxRows
+}
+
+// DeleteMessages godoc
+// @Summary Delete all bot history messages
+// @Description Clear all persisted bot-level history messages
+// @Tags messages
+// @Produce json
+// @Param bot_id path string true "Bot ID"
+// @Success 204 "No Content"
+// @Failure 400 {object} server.Problem
+// @Failure 403 {object} server.Problem
+// @Failure 500 {object} server.Problem
+// @Router /bots/{bot_id}/messages [delete].
 func (h *MessageHandler) DeleteMessages(c echo.Context) error {
 	channelIdentityID, err := h.requireChannelIdentityID(c)
 	if err != nil {
 		return err
 	}
-	botID := strings.TrimSpace(c.Param("bot_id"))
-	if botID == "" {
-		return echo.NewHTTPError(http.StatusBadRequest, "bot id is required")
-	}
-	if _, err := h.authorizeBotManage(c.Request().Context(), channelIdentityID, botID); err != nil {
+	botID, err := httpx.RequiredParam(c, "bot_id")
+	if err != nil {
 		return err
 	}
+	bot, err := h.authorizeBotManage(c.Request().Context(), channelIdentityID, botID)
+	if err != nil {
+		return err
+	}
+	botID = bot.ID
 	if h.messageService == nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "message service not configured")
 	}
-	if err := h.messageService.DeleteByBot(c.Request().Context(), botID); err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	sessionID := strings.TrimSpace(c.QueryParam("session_id"))
+	ctx := c.Request().Context()
+	if h.runtimeResets == nil {
+		return apperror.Wrap(
+			apperror.CodeSessionResetUnavailable,
+			errors.New("runtime reset is not configured"),
+			nil,
+		)
 	}
+	if sessionID != "" {
+		if h.sessionService == nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "session service not configured")
+		}
+		sess, getErr := h.sessionService.Get(ctx, sessionID)
+		if getErr != nil || sess.BotID != botID {
+			return apperror.New(apperror.CodeSessionNotFound, nil)
+		}
+		ctx, release, resetErr := h.runtimeResets.BeginSessionHistoryReset(ctx, botID, sessionID)
+		if resetErr != nil {
+			return historyResetError(resetErr)
+		}
+		defer release()
+		if err := h.messageService.DeleteBySession(ctx, sessionID); err != nil {
+			return apperror.Wrap(apperror.CodeHistoryDeleteFailed, err, nil)
+		}
+		if h.projectionCache != nil {
+			h.projectionCache.DropSession(sessionID)
+		}
+	} else {
+		ctx, release, resetErr := h.runtimeResets.BeginBotHistoryReset(ctx, botID)
+		if resetErr != nil {
+			return historyResetError(resetErr)
+		}
+		defer release()
+		if err := h.messageService.DeleteByBot(ctx, botID); err != nil {
+			return apperror.Wrap(apperror.CodeHistoryDeleteFailed, err, nil)
+		}
+		if h.projectionCache != nil {
+			h.projectionCache.DropAll()
+		}
+	}
+	messageevent.InvalidateSession(h.messagePublisher, botID, sessionID)
 	return c.NoContent(http.StatusNoContent)
 }
 
 // --- helpers ---
 
-// resolveWebChannelIdentity resolves (web, user_id) to a channel identity and sets req.SourceChannelIdentityID.
-// Web uses user_id as the channel subject id (like Feishu open_id); the resolved ci has display_name and is linked to the user.
-// Returns the channel_identity_id to use for the rest of the flow, or the original userID if resolution is skipped/fails.
-func (h *MessageHandler) resolveWebChannelIdentity(ctx context.Context, userID string, req *conversation.ChatRequest) string {
-	if strings.TrimSpace(req.CurrentChannel) != "web" || h.channelIdentitySvc == nil || strings.TrimSpace(userID) == "" {
-		return userID
+// historyResetError translates a failure to begin a history reset. The
+// conversation is busy only while something else holds it; any other failure
+// is answered by its fault (docs/errors.md).
+func historyResetError(err error) error {
+	switch {
+	case sessionruntime.IsHistoryResetBusy(err):
+		return apperror.Wrap(apperror.CodeSessionResetConflict, err, nil)
+	case errors.Is(err, sessionruntime.ErrHistoryResetUnavailable):
+		return apperror.Wrap(apperror.CodeSessionResetUnavailable, err, nil)
 	}
-	displayName := ""
-	if h.accountService != nil {
-		if account, err := h.accountService.Get(ctx, userID); err == nil {
-			displayName = strings.TrimSpace(account.DisplayName)
-			if displayName == "" {
-				displayName = strings.TrimSpace(account.Username)
-			}
-		}
-	}
-	ci, err := h.channelIdentitySvc.ResolveByChannelIdentity(ctx, "web", userID, displayName, nil)
-	if err != nil {
-		return userID
-	}
-	if err := h.channelIdentitySvc.LinkChannelIdentityToUser(ctx, ci.ID, userID); err != nil {
-		h.logger.Warn("link channel identity to user failed", slog.Any("error", err))
-	}
-	req.SourceChannelIdentityID = ci.ID
-	return ci.ID
+	return err
 }
 
-func (h *MessageHandler) requireChannelIdentityID(c echo.Context) (string, error) {
+func (*MessageHandler) requireChannelIdentityID(c echo.Context) (string, error) {
 	return RequireChannelIdentityID(c)
 }
 
 func (h *MessageHandler) authorizeBotAccess(ctx context.Context, channelIdentityID, botID string) (bots.Bot, error) {
-	return AuthorizeBotAccess(ctx, h.botService, h.accountService, channelIdentityID, botID, bots.AccessPolicy{AllowPublicMember: true})
+	return AuthorizeBotAccessWithPermission(ctx, h.botService, h.accountService, channelIdentityID, botID, bots.PermissionChat)
 }
 
 func (h *MessageHandler) authorizeBotManage(ctx context.Context, channelIdentityID, botID string) (bots.Bot, error) {
-	return AuthorizeBotAccess(ctx, h.botService, h.accountService, channelIdentityID, botID, bots.AccessPolicy{AllowPublicMember: false})
+	return AuthorizeBotAccessWithPermission(ctx, h.botService, h.accountService, channelIdentityID, botID, bots.PermissionManage)
 }
 
-func (h *MessageHandler) requireParticipant(ctx context.Context, conversationID, channelIdentityID string) error {
-	if h.conversationService == nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "conversation service not configured")
+func (h *MessageHandler) authorizeBotMessageAccess(c echo.Context, channelIdentityID, botID string) (bots.Bot, []string, error) {
+	if h.botService == nil || h.accountService == nil {
+		return bots.Bot{}, nil, echo.NewHTTPError(http.StatusInternalServerError, "bot services not configured")
 	}
-	// Admin bypass.
-	if h.accountService != nil {
-		isAdmin, err := h.accountService.IsAdmin(ctx, channelIdentityID)
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-		}
-		if isAdmin {
-			return nil
-		}
-	}
-	ok, err := h.conversationService.IsParticipant(ctx, conversationID, channelIdentityID)
+	ctx := c.Request().Context()
+	isAdmin, err := h.accountService.IsAdmin(ctx, channelIdentityID)
 	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		return bots.Bot{}, nil, errs.Wrap(err, "check admin")
 	}
-	if !ok {
-		return echo.NewHTTPError(http.StatusForbidden, "not a participant")
-	}
-	return nil
-}
-
-func (h *MessageHandler) requireReadable(ctx context.Context, conversationID, channelIdentityID string) error {
-	if h.conversationService == nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "conversation service not configured")
-	}
-	// Admin bypass.
-	if h.accountService != nil {
-		isAdmin, err := h.accountService.IsAdmin(ctx, channelIdentityID)
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-		}
-		if isAdmin {
-			return nil
-		}
-	}
-	_, err := h.conversationService.GetReadAccess(ctx, conversationID, channelIdentityID)
+	bot, err := h.botService.GetForAccess(ctx, botID)
 	if err != nil {
-		if errors.Is(err, conversation.ErrPermissionDenied) {
-			return echo.NewHTTPError(http.StatusForbidden, "not allowed to read conversation")
+		if errors.Is(err, pgx.ErrNoRows) {
+			return bots.Bot{}, nil, apperror.Wrap(apperror.CodeBotNotFound, err, nil)
 		}
-		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		return bots.Bot{}, nil, errs.Wrap(err, "get bot")
 	}
-	return nil
+	perms, err := h.botService.ResolveUserPermissionsForBot(ctx, bot, channelIdentityID, isAdmin)
+	if err != nil {
+		if errors.Is(err, bots.ErrBotNotFound) {
+			return bots.Bot{}, nil, apperror.Wrap(apperror.CodeBotNotFound, err, nil)
+		}
+		return bots.Bot{}, nil, errs.Wrap(err, "get bot")
+	}
+	if !bots.HasPermission(perms, bots.PermissionChat) && !bots.HasPermission(perms, bots.PermissionWorkspaceExec) {
+		return bots.Bot{}, nil, echo.NewHTTPError(http.StatusForbidden, "bot access denied")
+	}
+	return bot, perms, nil
 }
 
-// ServeMedia streams a media asset by bot_id + asset_id with read-access authorization.
+func (h *MessageHandler) authorizeMessageSession(c echo.Context, channelIdentityID, botID, sessionID string) (bots.Bot, []string, session.Thread, error) {
+	if h.sessionService == nil {
+		return bots.Bot{}, nil, session.Thread{}, echo.NewHTTPError(http.StatusInternalServerError, "session service not configured")
+	}
+	bot, perms, err := h.authorizeBotMessageAccess(c, channelIdentityID, botID)
+	if err != nil {
+		return bots.Bot{}, nil, session.Thread{}, err
+	}
+	sess, err := h.sessionService.Get(c.Request().Context(), sessionID)
+	if err != nil || sess.BotID != bot.ID {
+		return bots.Bot{}, nil, session.Thread{}, apperror.New(apperror.CodeSessionNotFound, nil)
+	}
+	if !canAccessSession(sess, channelIdentityID, perms) {
+		return bots.Bot{}, nil, session.Thread{}, apperror.New(apperror.CodeSessionNotFound, nil)
+	}
+	return bot, perms, sess, nil
+}
+
+// inlineSafeMedia lists the types a browser may display inline from the API
+// origin without running content: raster images, audio, video, PDF and text.
+func inlineSafeMedia(contentType string) bool {
+	base, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return false
+	}
+	switch base {
+	case "image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/bmp", "application/pdf", "text/plain":
+		return true
+	}
+	return strings.HasPrefix(base, "audio/") || strings.HasPrefix(base, "video/")
+}
+
+// ServeMedia streams a media asset by bot_id + content_hash with read-access authorization.
 func (h *MessageHandler) ServeMedia(c echo.Context) error {
 	channelIdentityID, err := h.requireChannelIdentityID(c)
 	if err != nil {
 		return err
 	}
-	botID := strings.TrimSpace(c.Param("bot_id"))
-	if botID == "" {
-		return echo.NewHTTPError(http.StatusBadRequest, "bot id is required")
-	}
-	assetID := strings.TrimSpace(c.Param("asset_id"))
-	if assetID == "" {
-		return echo.NewHTTPError(http.StatusBadRequest, "asset id is required")
-	}
-	if _, err := h.authorizeBotAccess(c.Request().Context(), channelIdentityID, botID); err != nil {
+	botID, err := httpx.RequiredParam(c, "bot_id")
+	if err != nil {
 		return err
 	}
-	if err := h.requireReadable(c.Request().Context(), botID, channelIdentityID); err != nil {
+	contentHash, err := httpx.RequiredParam(c, "content_hash")
+	if err != nil {
 		return err
 	}
+	bot, err := h.authorizeBotAccess(c.Request().Context(), channelIdentityID, botID)
+	if err != nil {
+		return err
+	}
+	botID = bot.ID
 	if h.mediaService == nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "media service not configured")
 	}
-	reader, asset, err := h.mediaService.Open(c.Request().Context(), assetID)
+	reader, asset, err := h.mediaService.Open(c.Request().Context(), botID, contentHash)
 	if err != nil {
 		if errors.Is(err, media.ErrAssetNotFound) {
-			return echo.NewHTTPError(http.StatusNotFound, "asset not found")
+			return apperror.Wrap(apperror.CodeMediaAssetNotFound, err, nil)
 		}
-		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		return errs.Wrap(err, "read media asset")
 	}
-	defer reader.Close()
-	// Verify asset belongs to the authorized bot.
-	if strings.TrimSpace(asset.BotID) != botID {
-		return echo.NewHTTPError(http.StatusForbidden, "asset does not belong to bot")
-	}
+	defer func() { _ = reader.Close() }()
 	contentType := asset.Mime
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
+	if !inlineSafeMedia(contentType) {
+		// Assets include model-referenced files and remote content. Active
+		// types such as HTML or SVG must never render on the app origin.
+		c.Response().Header().Set("Content-Disposition", "attachment")
+	}
+	c.Response().Header().Set("X-Content-Type-Options", "nosniff")
 	c.Response().Header().Set("Content-Type", contentType)
 	c.Response().Header().Set("Cache-Control", "private, max-age=86400")
-	if asset.OriginalName != "" {
-		c.Response().Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", asset.OriginalName))
-	}
 	c.Response().WriteHeader(http.StatusOK)
 	if _, err := io.Copy(c.Response().Writer, reader); err != nil {
-		h.logger.Warn("serve media stream failed", slog.Any("error", err))
+		h.logger.WarnContext(c.Request().Context(), "serve media stream failed", slog.Any("error", err))
 	}
 	return nil
 }

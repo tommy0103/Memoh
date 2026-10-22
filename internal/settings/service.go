@@ -2,30 +2,107 @@ package settings
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"github.com/memohai/memoh/internal/db"
-	"github.com/memohai/memoh/internal/db/sqlc"
+	"github.com/felinics/memoh/internal/acl"
+	acpprofile "github.com/felinics/memoh/internal/agent/runtime/acp/profile"
+	"github.com/felinics/memoh/internal/botagents"
+	"github.com/felinics/memoh/internal/db"
+	"github.com/felinics/memoh/internal/db/postgres/sqlc"
+	dbstore "github.com/felinics/memoh/internal/db/store"
+	netctl "github.com/felinics/memoh/internal/network"
+	"github.com/felinics/memoh/internal/reasoning"
+	"github.com/felinics/memoh/internal/runtimekind"
+	tzutil "github.com/felinics/memoh/internal/timezone"
 )
 
-type Service struct {
-	queries *sqlc.Queries
-	logger  *slog.Logger
+type ReasoningOptionsResolver interface {
+	ResolveReasoningOptions(context.Context, string) (reasoning.Options, error)
 }
 
-var ErrPersonalBotGuestAccessUnsupported = errors.New("personal bots do not support guest access")
+// BuiltinMemoryResolver returns the team's Built-in Memory provider row that a
+// memory-enabled bot references, creating it on first use.
+type BuiltinMemoryResolver interface {
+	EnsureBuiltinID(context.Context) (string, error)
+}
 
-func NewService(log *slog.Logger, queries *sqlc.Queries) *Service {
+type Service struct {
+	queries           dbstore.Queries
+	acl               *acl.Service
+	network           *netctl.Service
+	reasoningResolver ReasoningOptionsResolver
+	botAgents         *botagents.Service
+	builtinMemory     BuiltinMemoryResolver
+	logger            *slog.Logger
+}
+
+type defaultAgentTransactionalQueries interface {
+	SupportsTransactions() bool
+	InTx(context.Context, func(dbstore.Queries) error) error
+}
+
+var (
+	ErrModelIDAmbiguous            = errors.New("model_id is ambiguous across providers")
+	ErrInvalidModelRef             = errors.New("invalid model reference")
+	ErrReasoningOptionsUnavailable = errors.New("reasoning options unavailable")
+
+	// Chat runtime settings a bot cannot be saved with. Invalid chat_runtime
+	// is checked for every bot; the rest apply when the default chat runtime
+	// is an External Agent.
+	ErrInvalidChatRuntime    = errors.New("invalid chat_runtime")
+	ErrACPProjectModeInvalid = errors.New("invalid chat_acp_project_mode")
+	ErrACPProjectPathInvalid = errors.New("chat_acp_project_path must be absolute")
+	ErrACPUnknownAgent       = errors.New("unknown ACP agent")
+	ErrACPAgentNotEnabled    = errors.New("ACP agent is not enabled for this bot")
+	ErrACPAgentNotConfigured = errors.New("ACP agent is not configured for this bot")
+)
+
+type InvalidReasoningEffortError struct {
+	Effort  string
+	Options reasoning.Options
+}
+
+// InvalidModelRefError is ErrInvalidModelRef together with the request field
+// that held the reference.
+type InvalidModelRefError struct {
+	Field string
+	Err   error
+}
+
+func (e *InvalidModelRefError) Error() string { return e.Err.Error() }
+func (e *InvalidModelRefError) Unwrap() error { return e.Err }
+
+func (e *InvalidReasoningEffortError) Error() string {
+	return fmt.Sprintf("reasoning effort %q is not supported by the chat model", e.Effort)
+}
+
+func NewService(log *slog.Logger, queries dbstore.Queries, aclService *acl.Service, networkService *netctl.Service) *Service {
 	return &Service{
 		queries: queries,
+		acl:     aclService,
+		network: networkService,
 		logger:  log.With(slog.String("service", "settings")),
 	}
+}
+
+func (s *Service) SetReasoningOptionsResolver(resolver ReasoningOptionsResolver) {
+	s.reasoningResolver = resolver
+}
+
+func (s *Service) SetBotAgents(service *botagents.Service) {
+	s.botAgents = service
+}
+
+func (s *Service) SetBuiltinMemoryResolver(resolver BuiltinMemoryResolver) {
+	s.builtinMemory = resolver
 }
 
 func (s *Service) GetBot(ctx context.Context, botID string) (Settings, error) {
@@ -37,12 +114,36 @@ func (s *Service) GetBot(ctx context.Context, botID string) (Settings, error) {
 	if err != nil {
 		return Settings{}, err
 	}
-	return normalizeBotSettingsReadRow(row), nil
+	settings := normalizeBotSettingsReadRow(row)
+	aclDefaultEffect, err := s.getDefaultEffect(ctx, botID)
+	if err != nil {
+		return Settings{}, err
+	}
+	settings.AclDefaultEffect = aclDefaultEffect
+	return settings, nil
+}
+
+// GetCommandUILanguage returns just the command_ui_language setting for a bot.
+// Avoids the second getDefaultEffect query that GetBot triggers — the locale
+// is resolved once per slash command + once per interactive callback tap, so
+// keeping it single-query matters for paginated lists where users tap Prev/Next
+// repeatedly. Returns the raw value (caller is responsible for i18n.Resolve to
+// map "auto"/unknown → server default).
+func (s *Service) GetCommandUILanguage(ctx context.Context, botID string) (string, error) {
+	pgID, err := db.ParseUUID(botID)
+	if err != nil {
+		return "", err
+	}
+	row, err := s.queries.GetSettingsByBotID(ctx, pgID)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(row.CommandUiLanguage), nil
 }
 
 func (s *Service) UpsertBot(ctx context.Context, botID string, req UpsertRequest) (Settings, error) {
 	if s.queries == nil {
-		return Settings{}, fmt.Errorf("settings queries not configured")
+		return Settings{}, errors.New("settings queries not configured")
 	}
 	pgID, err := db.ParseUUID(botID)
 	if err != nil {
@@ -52,149 +153,994 @@ func (s *Service) UpsertBot(ctx context.Context, botID string, req UpsertRequest
 	if err != nil {
 		return Settings{}, err
 	}
-	isPersonalBot := strings.EqualFold(strings.TrimSpace(botRow.Type), "personal")
-
-	current := normalizeBotSetting(botRow.MaxContextLoadTime, botRow.Language, botRow.AllowGuest)
-	if req.MaxContextLoadTime != nil && *req.MaxContextLoadTime > 0 {
-		current.MaxContextLoadTime = *req.MaxContextLoadTime
-	}
-	if strings.TrimSpace(req.Language) != "" {
-		current.Language = strings.TrimSpace(req.Language)
-	}
-	if isPersonalBot {
-		if req.AllowGuest != nil && *req.AllowGuest {
-			return Settings{}, ErrPersonalBotGuestAccessUnsupported
-		}
-		current.AllowGuest = false
-	} else if req.AllowGuest != nil {
-		current.AllowGuest = *req.AllowGuest
-	}
-
-	chatModelUUID := pgtype.UUID{}
-	if value := strings.TrimSpace(req.ChatModelID); value != "" {
-		modelID, err := s.resolveModelUUID(ctx, value)
-		if err != nil {
-			return Settings{}, err
-		}
-		chatModelUUID = modelID
-	}
-	memoryModelUUID := pgtype.UUID{}
-	if value := strings.TrimSpace(req.MemoryModelID); value != "" {
-		modelID, err := s.resolveModelUUID(ctx, value)
-		if err != nil {
-			return Settings{}, err
-		}
-		memoryModelUUID = modelID
-	}
-	embeddingModelUUID := pgtype.UUID{}
-	if value := strings.TrimSpace(req.EmbeddingModelID); value != "" {
-		modelID, err := s.resolveModelUUID(ctx, value)
-		if err != nil {
-			return Settings{}, err
-		}
-		embeddingModelUUID = modelID
-	}
-	searchProviderUUID := pgtype.UUID{}
-	if value := strings.TrimSpace(req.SearchProviderID); value != "" {
-		providerID, err := db.ParseUUID(value)
-		if err != nil {
-			return Settings{}, err
-		}
-		searchProviderUUID = providerID
-	}
-
-	updated, err := s.queries.UpsertBotSettings(ctx, sqlc.UpsertBotSettingsParams{
-		ID:                 pgID,
-		MaxContextLoadTime: int32(current.MaxContextLoadTime),
-		Language:           current.Language,
-		AllowGuest:         current.AllowGuest,
-		ChatModelID:        chatModelUUID,
-		MemoryModelID:      memoryModelUUID,
-		EmbeddingModelID:   embeddingModelUUID,
-		SearchProviderID:   searchProviderUUID,
-	})
+	overlayBindingRow, err := s.queries.GetBotOverlayConfig(ctx, pgID)
 	if err != nil {
 		return Settings{}, err
 	}
-	return normalizeBotSettingsWriteRow(updated), nil
+	previousOverlayConfig := settingsOverlayConfigFromRow(overlayBindingRow)
+	if s.network != nil {
+		if resolvedPrevious, resolveErr := s.network.GetBotConfig(ctx, botID); resolveErr == nil {
+			previousOverlayConfig = resolvedPrevious
+		}
+	}
+	aclDefaultEffect, err := s.getDefaultEffect(ctx, botID)
+	if err != nil {
+		return Settings{}, err
+	}
+	current := normalizeBotSetting("", aclDefaultEffect, botRow.ReasoningEffort, botRow.CompactionEnabled, botRow.CompactionThreshold, botRow.CompactionTargetPercent)
+	// A read error here must abort: falling through would leave `current` at the
+	// model defaults and silently overwrite a saved chat_runtime=acp_agent (and
+	// its agent id) on the next save. ErrNoRows is impossible because the bot
+	// row was already fetched, but treat it as "keep defaults" defensively and
+	// only fail on a real DB error.
+	if settingsRow, settingsErr := s.queries.GetSettingsByBotID(ctx, pgID); settingsErr != nil {
+		if !errors.Is(settingsErr, pgx.ErrNoRows) {
+			return Settings{}, settingsErr
+		}
+	} else {
+		existingSettings := normalizeBotSettingsReadRow(settingsRow)
+		current.ChatModelID = existingSettings.ChatModelID
+		current.DefaultBotAgentID = existingSettings.DefaultBotAgentID
+		current.ChatRuntime = existingSettings.ChatRuntime
+		current.ChatACPAgentID = existingSettings.ChatACPAgentID
+		current.ChatACPProjectPath = existingSettings.ChatACPProjectPath
+		current.ChatACPProjectMode = existingSettings.ChatACPProjectMode
+		current.MemoryProviderID = existingSettings.MemoryProviderID
+		current.ToolApprovalConfig = parseToolApprovalConfig(settingsRow.ToolApprovalConfig)
+		current.DisplayEnabled = settingsRow.DisplayEnabled
+		current.CommandUILanguage = settingsRow.CommandUiLanguage
+	}
+	current.OverlayEnabled = overlayBindingRow.OverlayEnabled
+	current.OverlayProvider = strings.TrimSpace(overlayBindingRow.OverlayProvider)
+	current.OverlayConfig = normalizeJSONObject(overlayBindingRow.OverlayConfig)
+	if strings.TrimSpace(req.CommandUILanguage) != "" {
+		current.CommandUILanguage = strings.TrimSpace(req.CommandUILanguage)
+	}
+	if effect := strings.TrimSpace(req.AclDefaultEffect); effect != "" {
+		current.AclDefaultEffect = effect
+	}
+	if req.CompactionEnabled != nil {
+		current.CompactionEnabled = *req.CompactionEnabled
+	}
+	if req.CompactionThreshold != nil && *req.CompactionThreshold >= 0 {
+		current.CompactionThreshold = *req.CompactionThreshold
+	}
+	compactionTargetPercent, compactionTargetPercentSet := applyCompactionTargetPercentOverride(
+		current.CompactionTargetPercent,
+		req.CompactionTargetPercent,
+	)
+	current.CompactionTargetPercent = compactionTargetPercent
+	if req.PersistFullToolResults != nil {
+		current.PersistFullToolResults = *req.PersistFullToolResults
+	}
+	if req.ShowToolCallsInIM != nil {
+		current.ShowToolCallsInIM = *req.ShowToolCallsInIM
+	}
+	if req.ToolApprovalConfig != nil {
+		current.ToolApprovalConfig = NormalizeToolApprovalConfig(*req.ToolApprovalConfig)
+	}
+	if req.DisplayEnabled != nil {
+		current.DisplayEnabled = *req.DisplayEnabled
+	}
+	if req.ChatRuntime != nil {
+		current.ChatRuntime = normalizeChatRuntime(*req.ChatRuntime)
+		if current.ChatRuntime == "" {
+			return Settings{}, ErrInvalidChatRuntime
+		}
+	}
+	if req.ChatACPAgentID != nil {
+		current.ChatACPAgentID = acpprofile.NormalizeAgentID(*req.ChatACPAgentID)
+	}
+	if req.ChatACPProjectPath != nil {
+		current.ChatACPProjectPath = strings.TrimSpace(*req.ChatACPProjectPath)
+	}
+	if req.ChatACPProjectMode != nil {
+		current.ChatACPProjectMode = normalizeACPProjectMode(*req.ChatACPProjectMode)
+		if current.ChatACPProjectMode == "" {
+			return Settings{}, fmt.Errorf("%w: %q", ErrACPProjectModeInvalid, strings.TrimSpace(*req.ChatACPProjectMode))
+		}
+	}
+	defaultBotAgentIDSet := req.DefaultBotAgentID != nil
+	if req.DefaultBotAgentID != nil {
+		current.DefaultBotAgentID = strings.TrimSpace(*req.DefaultBotAgentID)
+	} else if req.ChatRuntime != nil && current.ChatRuntime == ChatRuntimeModel {
+		// Legacy Web/Desktop clients know only chat_runtime. An explicit switch
+		// to Native must therefore clear a migrated Agent binding even when the
+		// newer default_bot_agent_id field is absent from their request.
+		current.DefaultBotAgentID = ""
+		defaultBotAgentIDSet = true
+	}
+	if req.DefaultBotAgentID != nil && current.DefaultBotAgentID != "" {
+		if s.botAgents == nil {
+			return Settings{}, errors.New("bot agent service not configured")
+		}
+		agent, err := s.botAgents.GetActive(ctx, botID, current.DefaultBotAgentID)
+		if err != nil {
+			return Settings{}, err
+		}
+		descriptor, err := botagents.DescriptorFor(agent)
+		if err != nil {
+			return Settings{}, err
+		}
+		switch {
+		case descriptor.Runtime == botagents.RuntimeACP:
+			if err := s.botAgents.ValidateConfiguration(ctx, agent, normalizeJSONObject(botRow.Metadata)); err != nil {
+				return Settings{}, err
+			}
+			current.ChatRuntime = ChatRuntimeACPAgent
+			current.ChatACPAgentID = descriptor.Provider
+		case runtimekind.IsDirect(descriptor.Runtime):
+			// The stored default names the real runtime; direct agents need
+			// no ACP agent id (their identity IS the runtime).
+			current.ChatRuntime = descriptor.Runtime
+			current.ChatACPAgentID = ""
+		default:
+			return Settings{}, botagents.ErrInvalidRuntime
+		}
+	} else if defaultBotAgentIDSet {
+		// Native is the built-in singleton and is represented by a NULL foreign
+		// key rather than a synthetic bot_agents row.
+		current.ChatRuntime = ChatRuntimeModel
+		current.ChatACPAgentID = ""
+	}
+	timezoneValue := pgtype.Text{}
+	if req.Timezone != nil {
+		normalized, err := normalizeOptionalTimezone(*req.Timezone)
+		if err != nil {
+			return Settings{}, err
+		}
+		timezoneValue = normalized
+	}
+	if req.OverlayEnabled != nil {
+		current.OverlayEnabled = *req.OverlayEnabled
+	}
+	if req.OverlayProvider != nil {
+		current.OverlayProvider = strings.TrimSpace(*req.OverlayProvider)
+	}
+	if req.OverlayConfig != nil {
+		current.OverlayConfig = req.OverlayConfig
+	}
+	chatModelUUID := pgtype.UUID{}
+	chatModelIDSet := req.ChatModelID != nil
+	if req.ChatModelID != nil {
+		if value := strings.TrimSpace(*req.ChatModelID); value != "" {
+			modelID, err := s.resolveModelUUID(ctx, "chat_model_id", value)
+			if err != nil {
+				return Settings{}, err
+			}
+			chatModelUUID = modelID
+			if modelID.Valid {
+				current.ChatModelID = uuid.UUID(modelID.Bytes).String()
+			}
+		} else {
+			current.ChatModelID = ""
+		}
+	}
+	if err := s.applyReasoningPolicy(ctx, &current, req); err != nil {
+		return Settings{}, err
+	}
+	compactionModelUUID := pgtype.UUID{}
+	compactionModelIDSet := req.CompactionModelID != nil
+	if req.CompactionModelID != nil {
+		if value := strings.TrimSpace(*req.CompactionModelID); value != "" {
+			modelID, err := s.resolveModelUUID(ctx, "compaction_model_id", value)
+			if err != nil {
+				return Settings{}, err
+			}
+			compactionModelUUID = modelID
+		}
+	}
+	memoryLLMModelUUID := pgtype.UUID{}
+	memoryLLMModelIDSet := req.MemoryLLMModelID != nil
+	if req.MemoryLLMModelID != nil {
+		if value := strings.TrimSpace(*req.MemoryLLMModelID); value != "" {
+			modelID, err := s.resolveModelUUID(ctx, "memory_llm_model_id", value)
+			if err != nil {
+				return Settings{}, err
+			}
+			memoryLLMModelUUID = modelID
+		}
+	}
+	imageModelUUID := pgtype.UUID{}
+	imageModelIDSet := req.ImageModelID != nil
+	if req.ImageModelID != nil {
+		if value := strings.TrimSpace(*req.ImageModelID); value != "" {
+			modelID, err := s.resolveModelUUID(ctx, "image_model_id", value)
+			if err != nil {
+				return Settings{}, err
+			}
+			imageModelUUID = modelID
+		}
+	}
+	searchProviderUUID := pgtype.UUID{}
+	searchProviderIDSet := req.SearchProviderID != nil
+	if req.SearchProviderID != nil {
+		if value := strings.TrimSpace(*req.SearchProviderID); value != "" {
+			providerID, err := db.ParseUUID(value)
+			if err != nil {
+				return Settings{}, err
+			}
+			searchProviderUUID = providerID
+		}
+	}
+	fetchProviderUUID := pgtype.UUID{}
+	fetchProviderIDSet := req.FetchProviderID != nil
+	if req.FetchProviderID != nil {
+		if value := strings.TrimSpace(*req.FetchProviderID); value != "" {
+			providerID, err := db.ParseUUID(value)
+			if err != nil {
+				return Settings{}, err
+			}
+			fetchProviderUUID = providerID
+		}
+	}
+	// Enabling memory keeps a bot's existing Built-in Memory reference and
+	// otherwise points it at the team's builtin row; disabling clears it.
+	memoryProviderUUID := pgtype.UUID{}
+	memoryProviderIDSet := false
+	if req.MemoryEnabled != nil {
+		switch {
+		case !*req.MemoryEnabled:
+			memoryProviderIDSet = true
+		case strings.TrimSpace(current.MemoryProviderID) == "":
+			if s.builtinMemory == nil {
+				return Settings{}, errors.New("built-in memory not configured")
+			}
+			value, err := s.builtinMemory.EnsureBuiltinID(ctx)
+			if err != nil {
+				return Settings{}, err
+			}
+			providerID, err := db.ParseUUID(value)
+			if err != nil {
+				return Settings{}, err
+			}
+			memoryProviderUUID = providerID
+			memoryProviderIDSet = true
+		}
+	}
+	ttsModelUUID := pgtype.UUID{}
+	ttsModelIDSet := req.TtsModelID != nil
+	if req.TtsModelID != nil {
+		if value := strings.TrimSpace(*req.TtsModelID); value != "" {
+			modelID, err := db.ParseUUID(value)
+			if err != nil {
+				return Settings{}, err
+			}
+			ttsModelUUID = modelID
+		}
+	}
+	transcriptionModelUUID := pgtype.UUID{}
+	transcriptionModelIDSet := req.TranscriptionModelID != nil
+	if req.TranscriptionModelID != nil {
+		if value := strings.TrimSpace(*req.TranscriptionModelID); value != "" {
+			modelID, err := db.ParseUUID(value)
+			if err != nil {
+				return Settings{}, err
+			}
+			transcriptionModelUUID = modelID
+		}
+	}
+	videoModelUUID := pgtype.UUID{}
+	videoModelIDSet := req.VideoModelID != nil
+	if req.VideoModelID != nil {
+		if value := strings.TrimSpace(*req.VideoModelID); value != "" {
+			modelID, err := db.ParseUUID(value)
+			if err != nil {
+				return Settings{}, err
+			}
+			videoModelUUID = modelID
+		}
+	}
+	current = normalizeChatRuntimeFields(current)
+	if err := validateChatRuntimeSettings(botRow.Metadata, current, s.acpSetupResolver(ctx, botID)); err != nil {
+		return Settings{}, err
+	}
+	toolApprovalConfig, err := json.Marshal(current.ToolApprovalConfig)
+	if err != nil {
+		return Settings{}, err
+	}
+
+	normalizedNetwork, err := s.normalizeOverlayConfig(current)
+	if err != nil {
+		return Settings{}, err
+	}
+	nextOverlayConfig := settingsOverlayConfigFromSettings(normalizedNetwork)
+	networkChanged := s.network != nil && !overlayConfigsEqual(previousOverlayConfig, nextOverlayConfig)
+	rollbackNetworkChange := func(cause error) error {
+		if !networkChanged {
+			return cause
+		}
+		if rollbackErr := s.reconcileBotNetwork(ctx, botID, nextOverlayConfig, previousOverlayConfig); rollbackErr != nil {
+			return errors.Join(cause, fmt.Errorf("network rollback failed: %w", rollbackErr))
+		}
+		return cause
+	}
+	if networkChanged {
+		if err := s.reconcileBotNetwork(ctx, botID, previousOverlayConfig, nextOverlayConfig); err != nil {
+			if rollbackErr := s.reconcileBotNetwork(ctx, botID, nextOverlayConfig, previousOverlayConfig); rollbackErr != nil {
+				return Settings{}, errors.Join(fmt.Errorf("reconcile bot network: %w", err), fmt.Errorf("network rollback failed: %w", rollbackErr))
+			}
+			return Settings{}, err
+		}
+	}
+	overlayConfigJSON, err := json.Marshal(normalizedNetwork.OverlayConfig)
+	if err != nil {
+		return Settings{}, rollbackNetworkChange(fmt.Errorf("marshal network config: %w", err))
+	}
+	upsertParams := sqlc.UpsertBotSettingsParams{
+		ID:                         pgID,
+		Timezone:                   timezoneValue,
+		CommandUiLanguage:          current.CommandUILanguage,
+		ReasoningEffort:            current.ReasoningEffort,
+		CompactionEnabled:          current.CompactionEnabled,
+		CompactionThreshold:        int32(current.CompactionThreshold), //nolint:gosec // bounded by non-negative setter above
+		CompactionTargetPercentSet: compactionTargetPercentSet,
+		CompactionTargetPercent:    nullableCompactionTargetPercent(current.CompactionTargetPercent),
+		ChatModelID:                chatModelUUID,
+		ChatModelIDSet:             chatModelIDSet,
+		DefaultBotAgentID:          db.ParseUUIDOrEmpty(current.DefaultBotAgentID),
+		DefaultBotAgentIDSet:       defaultBotAgentIDSet,
+		ChatRuntime:                current.ChatRuntime,
+		ChatAcpAgentID:             nullableText(current.ChatACPAgentID),
+		ChatAcpProjectPath:         current.ChatACPProjectPath,
+		ChatAcpProjectMode:         current.ChatACPProjectMode,
+		CompactionModelIDSet:       compactionModelIDSet,
+		CompactionModelID:          compactionModelUUID,
+		MemoryLlmModelIDSet:        memoryLLMModelIDSet,
+		MemoryLlmModelID:           memoryLLMModelUUID,
+		ImageModelID:               imageModelUUID,
+		ImageModelIDSet:            imageModelIDSet,
+		SearchProviderID:           searchProviderUUID,
+		SearchProviderIDSet:        searchProviderIDSet,
+		FetchProviderIDSet:         fetchProviderIDSet,
+		FetchProviderID:            fetchProviderUUID,
+		MemoryProviderID:           memoryProviderUUID,
+		MemoryProviderIDSet:        memoryProviderIDSet,
+		TtsModelID:                 ttsModelUUID,
+		TtsModelIDSet:              ttsModelIDSet,
+		TranscriptionModelID:       transcriptionModelUUID,
+		TranscriptionModelIDSet:    transcriptionModelIDSet,
+		VideoModelID:               videoModelUUID,
+		VideoModelIDSet:            videoModelIDSet,
+		PersistFullToolResults:     current.PersistFullToolResults,
+		ShowToolCallsInIm:          current.ShowToolCallsInIM,
+		ToolApprovalConfig:         toolApprovalConfig,
+		DisplayEnabled:             current.DisplayEnabled,
+		OverlayProvider:            normalizedNetwork.OverlayProvider,
+		OverlayEnabled:             normalizedNetwork.OverlayEnabled,
+		OverlayConfig:              overlayConfigJSON,
+	}
+	updated, err := s.upsertBotSettings(ctx, upsertParams)
+	if err != nil {
+		return Settings{}, rollbackNetworkChange(err)
+	}
+	createdByUserID := ""
+	if botRow.OwnerUserID.Valid {
+		createdByUserID = uuid.UUID(botRow.OwnerUserID.Bytes).String()
+	}
+	_ = createdByUserID
+	if err := s.setDefaultEffect(ctx, botID, current.AclDefaultEffect); err != nil {
+		return Settings{}, err
+	}
+	settings := normalizeBotSettingsWriteRow(updated)
+	settings.AclDefaultEffect = current.AclDefaultEffect
+	return settings, nil
+}
+
+// upsertBotSettings serializes default-Agent changes with Agent availability
+// changes. The active recheck intentionally runs after the parent bot lock in
+// a separate statement, so READ COMMITTED observes a disable/delete that won
+// the lock before this assignment. Query-only test doubles retain the direct
+// path used by existing unit tests.
+func (s *Service) upsertBotSettings(ctx context.Context, params sqlc.UpsertBotSettingsParams) (sqlc.UpsertBotSettingsRow, error) {
+	if !params.DefaultBotAgentIDSet {
+		return s.queries.UpsertBotSettings(ctx, params)
+	}
+	txer, ok := s.queries.(defaultAgentTransactionalQueries)
+	if !ok || !txer.SupportsTransactions() {
+		return s.queries.UpsertBotSettings(ctx, params)
+	}
+
+	var updated sqlc.UpsertBotSettingsRow
+	err := txer.InTx(ctx, func(q dbstore.Queries) error {
+		if _, err := q.LockBotForAgentMutation(ctx, params.ID); err != nil {
+			return err
+		}
+		if params.DefaultBotAgentID.Valid {
+			agent, err := q.GetBotAgentByID(ctx, sqlc.GetBotAgentByIDParams{
+				BotID: params.ID,
+				ID:    params.DefaultBotAgentID,
+			})
+			if errors.Is(err, pgx.ErrNoRows) {
+				return botagents.ErrUnavailable
+			}
+			if err != nil {
+				return err
+			}
+			if !agent.Enabled || agent.DeletedAt.Valid {
+				return botagents.ErrUnavailable
+			}
+		}
+		var err error
+		updated, err = q.UpsertBotSettings(ctx, params)
+		return err
+	})
+	return updated, err
 }
 
 func (s *Service) Delete(ctx context.Context, botID string) error {
 	if s.queries == nil {
-		return fmt.Errorf("settings queries not configured")
+		return errors.New("settings queries not configured")
 	}
 	pgID, err := db.ParseUUID(botID)
 	if err != nil {
 		return err
 	}
-	return s.queries.DeleteSettingsByBotID(ctx, pgID)
+	if err := s.queries.DeleteSettingsByBotID(ctx, pgID); err != nil {
+		return err
+	}
+	return nil
 }
 
-func normalizeBotSetting(maxContextLoadTime int32, language string, allowGuest bool) Settings {
+func normalizeBotSetting(commandUILanguage string, aclDefaultEffect string, reasoningEffort string, compactionEnabled bool, compactionThreshold int32, compactionTargetPercent pgtype.Int4) Settings {
 	settings := Settings{
-		MaxContextLoadTime: int(maxContextLoadTime),
-		Language:           strings.TrimSpace(language),
-		AllowGuest:         allowGuest,
+		CommandUILanguage:       strings.TrimSpace(commandUILanguage),
+		AclDefaultEffect:        strings.TrimSpace(aclDefaultEffect),
+		ReasoningEffort:         strings.TrimSpace(reasoningEffort),
+		CompactionEnabled:       compactionEnabled,
+		CompactionThreshold:     int(compactionThreshold),
+		CompactionTargetPercent: normalizeCompactionTargetPercent(compactionTargetPercent),
+		ToolApprovalConfig:      DefaultToolApprovalConfig(),
+		ChatRuntime:             ChatRuntimeModel,
+		ChatACPProjectPath:      DefaultACPProjectPath,
+		ChatACPProjectMode:      DefaultACPProjectMode,
 	}
-	if settings.MaxContextLoadTime <= 0 {
-		settings.MaxContextLoadTime = DefaultMaxContextLoadTime
+	if settings.CommandUILanguage == "" {
+		settings.CommandUILanguage = DefaultCommandUILanguage
 	}
-	if settings.Language == "" {
-		settings.Language = DefaultLanguage
+	if settings.AclDefaultEffect == "" {
+		settings.AclDefaultEffect = "allow"
 	}
+	if !hasReasoningEffortValue(settings.ReasoningEffort) {
+		settings.ReasoningEffort = DefaultReasoningEffort
+	}
+	if settings.CompactionThreshold < 0 {
+		settings.CompactionThreshold = 0
+	}
+	settings.OverlayConfig = map[string]any{}
 	return settings
+}
+
+func normalizeCompactionTargetPercent(value pgtype.Int4) *int {
+	if !value.Valid {
+		return nil
+	}
+	return normalizeCompactionTargetPercentValue(int(value.Int32))
+}
+
+func normalizeCompactionTargetPercentValue(value int) *int {
+	if value < 1 || value > 99 {
+		return nil
+	}
+	return &value
+}
+
+func applyCompactionTargetPercentOverride(current, requested *int) (*int, bool) {
+	if requested == nil {
+		return current, false
+	}
+	return normalizeCompactionTargetPercentValue(*requested), true
+}
+
+func nullableCompactionTargetPercent(value *int) pgtype.Int4 {
+	if value == nil {
+		return pgtype.Int4{}
+	}
+	return pgtype.Int4{Int32: int32(*value), Valid: true} //nolint:gosec // normalized to 1-99
+}
+
+// isValidReasoningEffort accepts the full effort tier range. Effort is now a
+// free-form tier string (models expose their own supported levels via capability
+// discovery), so we only reject empty/whitespace values here; the specific tiers
+// a given model accepts are enforced upstream, not by this generic setting.
+func hasReasoningEffortValue(effort string) bool {
+	return strings.TrimSpace(effort) != ""
+}
+
+func (s *Service) applyReasoningPolicy(ctx context.Context, current *Settings, req UpsertRequest) error {
+	requestedSet := req.ReasoningEffort != nil && hasReasoningEffortValue(*req.ReasoningEffort)
+	if !requestedSet && req.ChatModelID == nil {
+		return nil
+	}
+
+	requested := ""
+	if requestedSet {
+		requested = normalizeDormantReasoningEffort(*req.ReasoningEffort)
+	}
+	if strings.TrimSpace(current.ChatModelID) == "" {
+		if requestedSet {
+			current.ReasoningEffort = requested
+		}
+		return nil
+	}
+	if s.reasoningResolver == nil {
+		return fmt.Errorf("%w: resolver not configured", ErrReasoningOptionsUnavailable)
+	}
+
+	opts, err := s.reasoningResolver.ResolveReasoningOptions(ctx, current.ChatModelID)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrReasoningOptionsUnavailable, err)
+	}
+	// A model without a reasoning concept keeps the dormant preference. This
+	// preserves import/create behavior and lets a later switch back to a reasoning
+	// model reconcile the value against that model's real options.
+	if !opts.Supported {
+		if requestedSet {
+			current.ReasoningEffort = requested
+		}
+		return nil
+	}
+	if requestedSet {
+		normalized, ok := reasoning.NormalizeSelection(requested, opts)
+		if !ok {
+			// Full model-setting payloads (create/import and the web model picker)
+			// may carry a preference from the previous model. Reconcile that stale
+			// value in the same write; effort-only requests are explicit choices and
+			// receive a validation error instead.
+			if req.ChatModelID != nil {
+				current.ReasoningEffort = reasoning.ReconcileStored(requested, opts)
+				return nil
+			}
+			return &InvalidReasoningEffortError{Effort: requested, Options: opts}
+		}
+		current.ReasoningEffort = normalized
+		return nil
+	}
+
+	current.ReasoningEffort = reasoning.ReconcileStored(current.ReasoningEffort, opts)
+	return nil
+}
+
+func normalizeDormantReasoningEffort(effort string) string {
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	if effort == "off" || reasoning.IsDisabled(effort) {
+		return reasoning.EffortDisable
+	}
+	return effort
 }
 
 func normalizeBotSettingsReadRow(row sqlc.GetSettingsByBotIDRow) Settings {
 	return normalizeBotSettingsFields(
-		row.MaxContextLoadTime,
-		row.Language,
-		row.AllowGuest,
+		row.CommandUiLanguage,
+		row.ReasoningEffort,
+		row.CompactionEnabled,
+		row.CompactionThreshold,
+		row.CompactionTargetPercent,
+		row.Timezone,
 		row.ChatModelID,
-		row.MemoryModelID,
-		row.EmbeddingModelID,
+		row.DefaultBotAgentID,
+		row.ChatRuntime,
+		row.ChatAcpAgentID,
+		row.ChatAcpProjectPath,
+		row.ChatAcpProjectMode,
+		row.CompactionModelID,
+		row.MemoryLlmModelID,
+		row.ImageModelID,
 		row.SearchProviderID,
+		row.FetchProviderID,
+		row.MemoryProviderID,
+		row.TtsModelID,
+		row.TranscriptionModelID,
+		row.VideoModelID,
+		row.PersistFullToolResults,
+		row.ShowToolCallsInIm,
+		row.ToolApprovalConfig,
+		row.DisplayEnabled,
+		row.OverlayProvider,
+		row.OverlayEnabled,
+		row.OverlayConfig,
 	)
 }
 
 func normalizeBotSettingsWriteRow(row sqlc.UpsertBotSettingsRow) Settings {
 	return normalizeBotSettingsFields(
-		row.MaxContextLoadTime,
-		row.Language,
-		row.AllowGuest,
+		row.CommandUiLanguage,
+		row.ReasoningEffort,
+		row.CompactionEnabled,
+		row.CompactionThreshold,
+		row.CompactionTargetPercent,
+		row.Timezone,
 		row.ChatModelID,
-		row.MemoryModelID,
-		row.EmbeddingModelID,
+		row.DefaultBotAgentID,
+		row.ChatRuntime,
+		row.ChatAcpAgentID,
+		row.ChatAcpProjectPath,
+		row.ChatAcpProjectMode,
+		row.CompactionModelID,
+		row.MemoryLlmModelID,
+		row.ImageModelID,
 		row.SearchProviderID,
+		row.FetchProviderID,
+		row.MemoryProviderID,
+		row.TtsModelID,
+		row.TranscriptionModelID,
+		row.VideoModelID,
+		row.PersistFullToolResults,
+		row.ShowToolCallsInIm,
+		row.ToolApprovalConfig,
+		row.DisplayEnabled,
+		row.OverlayProvider,
+		row.OverlayEnabled,
+		row.OverlayConfig,
 	)
 }
 
 func normalizeBotSettingsFields(
-	maxContextLoadTime int32,
-	language string,
-	allowGuest bool,
-	chatModelID pgtype.Text,
-	memoryModelID pgtype.Text,
-	embeddingModelID pgtype.Text,
+	commandUILanguage string,
+	reasoningEffort string,
+	compactionEnabled bool,
+	compactionThreshold int32,
+	compactionTargetPercent pgtype.Int4,
+	timezone pgtype.Text,
+	chatModelID pgtype.UUID,
+	defaultBotAgentID pgtype.UUID,
+	chatRuntime string,
+	chatACPAgentID pgtype.Text,
+	chatACPProjectPath string,
+	chatACPProjectMode string,
+	compactionModelID pgtype.UUID,
+	memoryLLMModelID pgtype.UUID,
+	imageModelID pgtype.UUID,
 	searchProviderID pgtype.UUID,
+	fetchProviderID pgtype.UUID,
+	memoryProviderID pgtype.UUID,
+	ttsModelID pgtype.UUID,
+	transcriptionModelID pgtype.UUID,
+	videoModelID pgtype.UUID,
+	persistFullToolResults bool,
+	showToolCallsInIM bool,
+	toolApprovalConfig []byte,
+	displayEnabled bool,
+	overlayProvider string,
+	overlayEnabled bool,
+	overlayConfig []byte,
 ) Settings {
-	settings := normalizeBotSetting(maxContextLoadTime, language, allowGuest)
-	settings.ChatModelID = strings.TrimSpace(chatModelID.String)
-	settings.MemoryModelID = strings.TrimSpace(memoryModelID.String)
-	settings.EmbeddingModelID = strings.TrimSpace(embeddingModelID.String)
+	settings := normalizeBotSetting(commandUILanguage, "", reasoningEffort, compactionEnabled, compactionThreshold, compactionTargetPercent)
+	if timezone.Valid {
+		settings.Timezone = timezone.String
+	}
+	if chatModelID.Valid {
+		settings.ChatModelID = uuid.UUID(chatModelID.Bytes).String()
+	}
+	if defaultBotAgentID.Valid {
+		settings.DefaultBotAgentID = uuid.UUID(defaultBotAgentID.Bytes).String()
+	}
+	settings.ChatRuntime = normalizeChatRuntimeValue(chatRuntime)
+	if settings.ChatRuntime == "" {
+		settings.ChatRuntime = ChatRuntimeModel
+	}
+	if chatACPAgentID.Valid {
+		settings.ChatACPAgentID = acpprofile.NormalizeAgentID(chatACPAgentID.String)
+	}
+	// A stored borrowed-shape row (pre-cutover data reached outside the
+	// migration path) is projected as its real runtime, so readers only ever
+	// see the retired shape's meaning, never its encoding.
+	if settings.ChatRuntime == ChatRuntimeACPAgent && runtimekind.IsDirect(settings.ChatACPAgentID) {
+		settings.ChatRuntime = settings.ChatACPAgentID
+		settings.ChatACPAgentID = ""
+	}
+	settings.ChatACPProjectPath = strings.TrimSpace(chatACPProjectPath)
+	if settings.ChatACPProjectPath == "" {
+		settings.ChatACPProjectPath = DefaultACPProjectPath
+	}
+	settings.ChatACPProjectMode = normalizeACPProjectMode(chatACPProjectMode)
+	if settings.ChatACPProjectMode == "" {
+		settings.ChatACPProjectMode = DefaultACPProjectMode
+	}
+	if compactionModelID.Valid {
+		settings.CompactionModelID = uuid.UUID(compactionModelID.Bytes).String()
+	}
+	if memoryLLMModelID.Valid {
+		settings.MemoryLLMModelID = uuid.UUID(memoryLLMModelID.Bytes).String()
+	}
+	if imageModelID.Valid {
+		settings.ImageModelID = uuid.UUID(imageModelID.Bytes).String()
+	}
 	if searchProviderID.Valid {
 		settings.SearchProviderID = uuid.UUID(searchProviderID.Bytes).String()
 	}
+	if fetchProviderID.Valid {
+		settings.FetchProviderID = uuid.UUID(fetchProviderID.Bytes).String()
+	}
+	if memoryProviderID.Valid {
+		settings.MemoryProviderID = uuid.UUID(memoryProviderID.Bytes).String()
+		settings.MemoryEnabled = true
+	}
+	if ttsModelID.Valid {
+		settings.TtsModelID = uuid.UUID(ttsModelID.Bytes).String()
+	}
+	if transcriptionModelID.Valid {
+		settings.TranscriptionModelID = uuid.UUID(transcriptionModelID.Bytes).String()
+	}
+	if videoModelID.Valid {
+		settings.VideoModelID = uuid.UUID(videoModelID.Bytes).String()
+	}
+	settings.PersistFullToolResults = persistFullToolResults
+	settings.ShowToolCallsInIM = showToolCallsInIM
+	settings.ToolApprovalConfig = parseToolApprovalConfig(toolApprovalConfig)
+	settings.DisplayEnabled = displayEnabled
+	settings.OverlayProvider = strings.TrimSpace(overlayProvider)
+	settings.OverlayEnabled = overlayEnabled
+	settings.OverlayConfig = normalizeJSONObject(overlayConfig)
 	return settings
 }
 
-func (s *Service) resolveModelUUID(ctx context.Context, modelID string) (pgtype.UUID, error) {
-	if strings.TrimSpace(modelID) == "" {
-		return pgtype.UUID{}, fmt.Errorf("model_id is required")
+func parseToolApprovalConfig(raw []byte) ToolApprovalConfig {
+	if len(raw) == 0 {
+		return DefaultToolApprovalConfig()
 	}
-	row, err := s.queries.GetModelByModelID(ctx, modelID)
+	var cfg ToolApprovalConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return DefaultToolApprovalConfig()
+	}
+	return NormalizeToolApprovalConfig(cfg)
+}
+
+func normalizeJSONObject(raw []byte) map[string]any {
+	if len(raw) == 0 {
+		return map[string]any{}
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil || out == nil {
+		return map[string]any{}
+	}
+	return out
+}
+
+func normalizeChatRuntime(raw string) string {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	if raw == "" {
+		return ChatRuntimeModel
+	}
+	if kind, ok := runtimekind.Normalize(raw); ok {
+		return string(kind)
+	}
+	return ""
+}
+
+func normalizeChatRuntimeValue(raw string) string {
+	if normalized := normalizeChatRuntime(raw); normalized != "" {
+		return normalized
+	}
+	return ChatRuntimeModel
+}
+
+func normalizeACPProjectMode(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", DefaultACPProjectMode:
+		return DefaultACPProjectMode
+	case "none":
+		return "none"
+	default:
+		return ""
+	}
+}
+
+func nullableText(value string) pgtype.Text {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return pgtype.Text{}
+	}
+	return pgtype.Text{String: value, Valid: true}
+}
+
+func normalizeChatRuntimeFields(current Settings) Settings {
+	current.ChatRuntime = normalizeChatRuntimeValue(current.ChatRuntime)
+	current.ChatACPAgentID = acpprofile.NormalizeAgentID(current.ChatACPAgentID)
+	// Pre-cutover writers (imported backups, stale clients) still express a
+	// direct default as acp_agent plus a direct agent id. Converge to the
+	// real runtime here so the borrowed shape never re-enters the database.
+	if current.ChatRuntime == ChatRuntimeACPAgent && runtimekind.IsDirect(current.ChatACPAgentID) {
+		current.ChatRuntime = current.ChatACPAgentID
+		current.ChatACPAgentID = ""
+	}
+	current.ChatACPProjectPath = strings.TrimSpace(current.ChatACPProjectPath)
+	if current.ChatACPProjectPath == "" {
+		current.ChatACPProjectPath = DefaultACPProjectPath
+	}
+	current.ChatACPProjectMode = normalizeACPProjectMode(current.ChatACPProjectMode)
+	if current.ChatACPProjectMode == "" {
+		current.ChatACPProjectMode = DefaultACPProjectMode
+	}
+	return current
+}
+
+// acpSetupResolver returns the setup a provider-addressed ACP default runs
+// with.
+type acpSetupResolver func(agentID string, botMetadata map[string]any) (acpprofile.AgentSetup, error)
+
+func legacyACPSetup(agentID string, botMetadata map[string]any) (acpprofile.AgentSetup, error) {
+	return acpprofile.ParseAgentSetup(botMetadata, agentID), nil
+}
+
+func (s *Service) acpSetupResolver(ctx context.Context, botID string) acpSetupResolver {
+	if s.botAgents == nil {
+		return legacyACPSetup
+	}
+	return func(agentID string, botMetadata map[string]any) (acpprofile.AgentSetup, error) {
+		return s.botAgents.ResolveACPSetup(ctx, botID, "", agentID, botMetadata)
+	}
+}
+
+func validateChatRuntimeSettings(botMetadata []byte, current Settings, resolveSetup acpSetupResolver) error {
+	current = normalizeChatRuntimeFields(current)
+	if strings.TrimSpace(current.DefaultBotAgentID) != "" {
+		// The BotAgent path validates availability and shared provider config
+		// before this compatibility validator is reached.
+		return nil
+	}
+	if current.ChatRuntime != ChatRuntimeACPAgent {
+		return nil
+	}
+	agentID := acpprofile.NormalizeAgentID(current.ChatACPAgentID)
+	if agentID == "" {
+		return fmt.Errorf("%w: chat_acp_agent_id is required when chat_runtime is acp_agent", ErrACPAgentNotConfigured)
+	}
+	if current.ChatACPProjectMode == "none" {
+		return fmt.Errorf("%w: none is not supported for the default chat runtime", ErrACPProjectModeInvalid)
+	}
+	if !strings.HasPrefix(strings.TrimSpace(current.ChatACPProjectPath), "/") {
+		return ErrACPProjectPathInvalid
+	}
+	profile, ok := acpprofile.Lookup(agentID)
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrACPUnknownAgent, agentID)
+	}
+	setup, err := resolveSetup(agentID, normalizeJSONObject(botMetadata))
+	if err != nil {
+		return err
+	}
+	if !setup.Enabled {
+		return fmt.Errorf("%w: %q", ErrACPAgentNotEnabled, agentID)
+	}
+	if field, missing := acpprofile.MissingRequiredManagedFieldForPreflight(profile, setup); missing {
+		return fmt.Errorf("%w: ACP agent %q is missing required field %q", ErrACPAgentNotConfigured, agentID, field.ID)
+	}
+	return nil
+}
+
+func (s *Service) normalizeOverlayConfig(current Settings) (Settings, error) {
+	current.OverlayProvider = strings.TrimSpace(current.OverlayProvider)
+	current.OverlayConfig = cloneSettingsMap(current.OverlayConfig)
+	if current.OverlayProvider == "" {
+		if current.OverlayEnabled {
+			return Settings{}, errors.New("network provider is required when network is enabled")
+		}
+		current.OverlayConfig = map[string]any{}
+		return current, nil
+	}
+	if s.network == nil {
+		return Settings{}, errors.New("network service not configured")
+	}
+	cfg, err := s.network.PrepareBotConfigForWrite(netctl.BotOverlayConfig{
+		Enabled:  current.OverlayEnabled,
+		Provider: current.OverlayProvider,
+		Config:   current.OverlayConfig,
+	})
+	if err != nil {
+		return Settings{}, err
+	}
+	current.OverlayEnabled = cfg.Enabled
+	current.OverlayProvider = cfg.Provider
+	current.OverlayConfig = cfg.Config
+	return current, nil
+}
+
+func cloneSettingsMap(in map[string]any) map[string]any {
+	if len(in) == 0 {
+		return map[string]any{}
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func settingsOverlayConfigFromRow(row sqlc.GetBotOverlayConfigRow) netctl.BotOverlayConfig {
+	return netctl.BotOverlayConfig{
+		Enabled:  row.OverlayEnabled,
+		Provider: strings.TrimSpace(row.OverlayProvider),
+		Config:   normalizeJSONObject(row.OverlayConfig),
+	}
+}
+
+func settingsOverlayConfigFromSettings(current Settings) netctl.BotOverlayConfig {
+	return netctl.BotOverlayConfig{
+		Enabled:  current.OverlayEnabled,
+		Provider: strings.TrimSpace(current.OverlayProvider),
+		Config:   cloneSettingsMap(current.OverlayConfig),
+	}
+}
+
+func overlayConfigsEqual(left, right netctl.BotOverlayConfig) bool {
+	if left.Enabled != right.Enabled || left.Provider != right.Provider {
+		return false
+	}
+	return jsonEqual(left.Config, right.Config)
+}
+
+func (s *Service) reconcileBotNetwork(ctx context.Context, botID string, previous, next netctl.BotOverlayConfig) error {
+	if s.network == nil || overlayConfigsEqual(previous, next) {
+		return nil
+	}
+	return s.network.ReconcileBot(ctx, botID, previous, next)
+}
+
+func jsonEqual(left, right map[string]any) bool {
+	leftJSON, leftErr := json.Marshal(left)
+	rightJSON, rightErr := json.Marshal(right)
+	if leftErr != nil || rightErr != nil {
+		return false
+	}
+	return string(leftJSON) == string(rightJSON)
+}
+
+func (s *Service) getDefaultEffect(ctx context.Context, botID string) (string, error) {
+	if s.acl == nil {
+		return "allow", nil
+	}
+	return s.acl.GetDefaultEffect(ctx, botID)
+}
+
+func (s *Service) setDefaultEffect(ctx context.Context, botID, effect string) error {
+	if s.acl == nil {
+		return nil
+	}
+	if effect == "" {
+		return nil
+	}
+	return s.acl.SetDefaultEffect(ctx, botID, effect)
+}
+
+// resolveModelUUID resolves the model a request names in field. A reference
+// that is empty or matches no model is returned as *InvalidModelRefError.
+func (s *Service) resolveModelUUID(ctx context.Context, field, modelID string) (pgtype.UUID, error) {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return pgtype.UUID{}, &InvalidModelRefError{Field: field, Err: fmt.Errorf("%w: model_id is required", ErrInvalidModelRef)}
+	}
+
+	// Preferred path: when caller already passes the model UUID.
+	if parsed, err := db.ParseUUID(modelID); err == nil {
+		if _, err := s.queries.GetModelByID(ctx, parsed); err == nil {
+			return parsed, nil
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return pgtype.UUID{}, err
+		}
+	}
+
+	rows, err := s.queries.ListModelsByModelID(ctx, modelID)
 	if err != nil {
 		return pgtype.UUID{}, err
 	}
-	return row.ID, nil
+	if len(rows) == 0 {
+		return pgtype.UUID{}, &InvalidModelRefError{Field: field, Err: fmt.Errorf("%w: model not found: %s", ErrInvalidModelRef, modelID)}
+	}
+	if len(rows) > 1 {
+		return pgtype.UUID{}, fmt.Errorf("%w: %s", ErrModelIDAmbiguous, modelID)
+	}
+	return rows[0].ID, nil
+}
+
+func normalizeOptionalTimezone(raw string) (pgtype.Text, error) {
+	normalized := strings.TrimSpace(raw)
+	if normalized == "" {
+		return pgtype.Text{}, nil
+	}
+	loc, _, err := tzutil.Resolve(normalized)
+	if err != nil {
+		return pgtype.Text{}, fmt.Errorf("invalid timezone: %w", err)
+	}
+	return pgtype.Text{String: loc.String(), Valid: true}, nil
 }

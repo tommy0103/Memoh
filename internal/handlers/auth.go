@@ -9,8 +9,10 @@ import (
 
 	"github.com/labstack/echo/v4"
 
-	"github.com/memohai/memoh/internal/accounts"
-	"github.com/memohai/memoh/internal/auth"
+	"github.com/felinics/memoh/internal/accounts"
+	"github.com/felinics/memoh/internal/apperror"
+	"github.com/felinics/memoh/internal/auth"
+	"github.com/felinics/memoh/internal/errs"
 )
 
 type AuthHandler struct {
@@ -22,17 +24,18 @@ type AuthHandler struct {
 
 type LoginRequest struct {
 	Username string `json:"username"`
-	Password string `json:"password"`
+	Password string `json:"password"` //nolint:gosec // intentional: JSON request field carrying a user-supplied credential
 }
 
 type LoginResponse struct {
-	AccessToken string `json:"access_token"`
+	AccessToken string `json:"access_token"` //nolint:gosec // intentional: JWT is the purpose of this response field
 	TokenType   string `json:"token_type"`
 	ExpiresAt   string `json:"expires_at"`
 	UserID      string `json:"user_id"`
 	Role        string `json:"role"`
 	DisplayName string `json:"display_name"`
 	Username    string `json:"username"`
+	Timezone    string `json:"timezone,omitempty"`
 }
 
 func NewAuthHandler(log *slog.Logger, accountService *accounts.Service, jwtSecret string, expiresIn time.Duration) *AuthHandler {
@@ -46,6 +49,7 @@ func NewAuthHandler(log *slog.Logger, accountService *accounts.Service, jwtSecre
 
 func (h *AuthHandler) Register(e *echo.Echo) {
 	e.POST("/auth/login", h.Login)
+	e.POST("/auth/refresh", h.Refresh)
 }
 
 // Login godoc
@@ -54,10 +58,10 @@ func (h *AuthHandler) Register(e *echo.Echo) {
 // @Tags auth
 // @Param payload body LoginRequest true "Login request"
 // @Success 200 {object} LoginResponse
-// @Failure 400 {object} ErrorResponse
-// @Failure 401 {object} ErrorResponse
-// @Failure 500 {object} ErrorResponse
-// @Router /auth/login [post]
+// @Failure 400 {object} server.Problem
+// @Failure 401 {object} server.Problem
+// @Failure 500 {object} server.Problem
+// @Router /auth/login [post].
 func (h *AuthHandler) Login(c echo.Context) error {
 	if h.accountService == nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "user service not configured")
@@ -71,11 +75,14 @@ func (h *AuthHandler) Login(c echo.Context) error {
 
 	var req LoginRequest
 	if err := c.Bind(&req); err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		return err
 	}
 	req.Username = strings.TrimSpace(req.Username)
-	if req.Username == "" || strings.TrimSpace(req.Password) == "" {
-		return echo.NewHTTPError(http.StatusBadRequest, "username and password are required")
+	if req.Username == "" {
+		return apperror.FieldRequired("username")
+	}
+	if strings.TrimSpace(req.Password) == "" {
+		return apperror.FieldRequired("password")
 	}
 
 	account, err := h.accountService.Login(c.Request().Context(), req.Username, req.Password)
@@ -86,11 +93,11 @@ func (h *AuthHandler) Login(c echo.Context) error {
 		if errors.Is(err, accounts.ErrInactiveAccount) {
 			return echo.NewHTTPError(http.StatusUnauthorized, "user is inactive")
 		}
-		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		return errs.Wrap(err, "login")
 	}
 	token, expiresAt, err := auth.GenerateToken(account.ID, h.jwtSecret, h.expiresIn)
 	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		return errs.Wrap(err, "generate token")
 	}
 
 	return c.JSON(http.StatusOK, LoginResponse{
@@ -101,5 +108,38 @@ func (h *AuthHandler) Login(c echo.Context) error {
 		Username:    account.Username,
 		Role:        account.Role,
 		DisplayName: account.DisplayName,
+		Timezone:    account.Timezone,
+	})
+}
+
+type RefreshResponse struct {
+	AccessToken string `json:"access_token"` //nolint:gosec // intentional: JWT is the purpose of this response field
+	TokenType   string `json:"token_type"`
+	ExpiresAt   string `json:"expires_at"`
+}
+
+// Refresh godoc
+// @Summary Refresh Token
+// @Description Issue a new JWT using the existing claims with updated expiration
+// @Tags auth
+// @Security BearerAuth
+// @Success 200 {object} RefreshResponse
+// @Failure 401 {object} server.Problem
+// @Failure 500 {object} server.Problem
+// @Router /auth/refresh [post].
+func (h *AuthHandler) Refresh(c echo.Context) error {
+	if strings.TrimSpace(h.jwtSecret) == "" {
+		return echo.NewHTTPError(http.StatusInternalServerError, "jwt secret not configured")
+	}
+
+	token, expiresAt, err := auth.RefreshTokenFromContext(c, h.jwtSecret, h.expiresIn)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusUnauthorized).WithInternal(err)
+	}
+
+	return c.JSON(http.StatusOK, RefreshResponse{
+		AccessToken: token,
+		TokenType:   "Bearer",
+		ExpiresAt:   expiresAt.Format(time.RFC3339),
 	})
 }

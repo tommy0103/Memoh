@@ -1,15 +1,39 @@
 package telegram
 
 import (
-	"fmt"
+	"errors"
 	"strings"
 
-	"github.com/memohai/memoh/internal/channel"
+	"github.com/felinics/memoh/internal/channel"
+	"github.com/felinics/memoh/internal/channel/common"
 )
+
+const defaultAPIBaseURL = "https://api.telegram.org"
 
 // Config holds the Telegram bot credentials extracted from a channel configuration.
 type Config struct {
-	BotToken string
+	BotToken   string
+	APIBaseURL string // Reverse proxy base URL for regions where Telegram is blocked (e.g. China mainland)
+	HTTPProxy  common.HTTPProxyConfig
+}
+
+// baseURL returns the effective base URL with trailing slashes removed.
+func (c Config) baseURL() string {
+	base := c.APIBaseURL
+	if base == "" {
+		base = defaultAPIBaseURL
+	}
+	return strings.TrimRight(base, "/")
+}
+
+// apiEndpoint returns the Sprintf-formatted API endpoint derived from the base URL.
+func (c Config) apiEndpoint() string {
+	return c.baseURL() + "/bot%s/%s"
+}
+
+// fileEndpoint returns the Sprintf-formatted file download endpoint derived from the base URL.
+func (c Config) fileEndpoint() string {
+	return c.baseURL() + "/file/bot%s/%s"
 }
 
 // UserConfig holds the identifiers used to target a Telegram user or group.
@@ -24,9 +48,14 @@ func normalizeConfig(raw map[string]any) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{
+	out := map[string]any{
 		"botToken": cfg.BotToken,
-	}, nil
+	}
+	if cfg.APIBaseURL != "" {
+		out["apiBaseURL"] = cfg.APIBaseURL
+	}
+	common.NormalizeHTTPProxyConfig(out, cfg.HTTPProxy)
+	return out, nil
 }
 
 func normalizeUserConfig(raw map[string]any) (map[string]any, error) {
@@ -65,7 +94,7 @@ func resolveTarget(raw map[string]any) (string, error) {
 		}
 		return name, nil
 	}
-	return "", fmt.Errorf("telegram binding is incomplete")
+	return "", errors.New("telegram binding is incomplete")
 }
 
 func matchBinding(raw map[string]any, criteria channel.BindingCriteria) bool {
@@ -107,9 +136,14 @@ func buildUserConfig(identity channel.Identity) map[string]any {
 func parseConfig(raw map[string]any) (Config, error) {
 	token := strings.TrimSpace(channel.ReadString(raw, "botToken", "bot_token"))
 	if token == "" {
-		return Config{}, fmt.Errorf("telegram botToken is required")
+		return Config{}, errors.New("telegram botToken is required")
 	}
-	return Config{BotToken: token}, nil
+	apiBaseURL := strings.TrimSpace(channel.ReadString(raw, "apiBaseURL", "api_base_url"))
+	proxyCfg, err := common.ParseHTTPProxyConfig(raw)
+	if err != nil {
+		return Config{}, err
+	}
+	return Config{BotToken: token, APIBaseURL: apiBaseURL, HTTPProxy: proxyCfg}, nil
 }
 
 func parseUserConfig(raw map[string]any) (UserConfig, error) {
@@ -117,7 +151,7 @@ func parseUserConfig(raw map[string]any) (UserConfig, error) {
 	userID := strings.TrimSpace(channel.ReadString(raw, "userId", "user_id"))
 	chatID := strings.TrimSpace(channel.ReadString(raw, "chatId", "chat_id"))
 	if username == "" && userID == "" && chatID == "" {
-		return UserConfig{}, fmt.Errorf("telegram user config requires username, user_id, or chat_id")
+		return UserConfig{}, errors.New("telegram user config requires username, user_id, or chat_id")
 	}
 	return UserConfig{
 		Username: username,
@@ -146,15 +180,24 @@ func normalizeTarget(raw string) string {
 	if strings.HasPrefix(value, "@") {
 		return value
 	}
-	isNumeric := true
-	for _, r := range value {
-		if r < '0' || r > '9' {
-			isNumeric = false
-			break
-		}
-	}
-	if isNumeric {
+	if chat, _ := splitTelegramTopicTarget(value); isTelegramChatID(chat) {
 		return value
 	}
 	return "@" + value
+}
+
+// isTelegramChatID returns true when s looks like a Telegram numeric chat ID,
+// which may be negative (e.g. supergroup IDs like -1002280927535).
+func isTelegramChatID(s string) bool {
+	digits := s
+	digits = strings.TrimPrefix(digits, "-")
+	if len(digits) == 0 {
+		return false
+	}
+	for _, r := range digits {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }

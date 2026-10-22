@@ -10,10 +10,15 @@ import (
 	"sync"
 	"time"
 
-	mcpgw "github.com/memohai/memoh/internal/mcp"
+	mcpgw "github.com/felinics/memoh/internal/mcp"
+	"github.com/felinics/memoh/internal/toolcontext"
 )
 
 const cacheTTL = 5 * time.Second
+
+// mcpCallTimeout caps individual MCP tool calls and tool listing to prevent
+// stuck external MCP servers from blocking the agent indefinitely.
+const mcpCallTimeout = 60 * time.Second
 
 type ConnectionLister interface {
 	ListActiveByBot(ctx context.Context, botID string) ([]mcpgw.Connection, error)
@@ -46,22 +51,40 @@ type Source struct {
 	logger      *slog.Logger
 	gateway     Gateway
 	connections ConnectionLister
+	reserved    func(string) bool
 
 	mu    sync.Mutex
 	cache map[string]cacheEntry
 }
 
-func NewSource(log *slog.Logger, gateway Gateway, connections ConnectionLister) *Source {
+type SourceOption func(*Source)
+
+func WithReservedToolName(fn func(string) bool) SourceOption {
+	return func(s *Source) {
+		s.reserved = fn
+	}
+}
+
+func NewSource(log *slog.Logger, gateway Gateway, connections ConnectionLister, opts ...SourceOption) *Source {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Source{
-		logger:      log.With(slog.String("source", "federated_mcp_tool")),
+	source := &Source{
+		logger:      log.With(slog.String("tool_source", "federated_mcp_tool")),
 		gateway:     gateway,
 		connections: connections,
 		cache:       map[string]cacheEntry{},
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(source)
+		}
+	}
+	return source
 }
+
+// Invalidate forgets discovery after a management change.
+func (s *Source) Invalidate(botID string) { s.mu.Lock(); delete(s.cache, botID); s.mu.Unlock() }
 
 func (s *Source) ListTools(ctx context.Context, session mcpgw.ToolSessionContext) ([]mcpgw.ToolDescriptor, error) {
 	botID := strings.TrimSpace(session.BotID)
@@ -93,15 +116,37 @@ func (s *Source) CallTool(ctx context.Context, session mcpgw.ToolSessionContext,
 	if !ok {
 		// Refresh route cache; result intentionally discarded.
 		if _, err := s.ListTools(ctx, session); err != nil {
-			s.logger.Warn("federation: refresh tools cache failed", slog.Any("error", err))
+			s.logger.WarnContext(ctx, "federation: refresh tools cache failed", slog.Any("error", err))
 		}
 		route, ok = s.getRoute(botID, toolName)
 		if !ok {
 			return nil, mcpgw.ErrToolNotFound
 		}
 	}
+	connections, listErr := s.connections.ListActiveByBot(ctx, botID)
+	if listErr != nil {
+		return nil, listErr
+	}
+	valid := false
+	for _, connection := range connections {
+		if connection.ID == route.connection.ID && connection.UpdatedAt.Equal(route.connection.UpdatedAt) {
+			valid = true
+			route.connection = connection
+			break
+		}
+	}
+	if !valid {
+		s.Invalidate(botID)
+		return nil, mcpgw.ErrToolNotFound
+	}
 	if arguments == nil {
 		arguments = map[string]any{}
+	}
+
+	callCtx, callCancel := context.WithTimeout(ctx, mcpCallTimeout)
+	defer callCancel()
+	if err := toolcontext.ValidateRuntimeGuard(callCtx, session); err != nil {
+		return nil, err
 	}
 
 	var (
@@ -110,11 +155,11 @@ func (s *Source) CallTool(ctx context.Context, session mcpgw.ToolSessionContext,
 	)
 	switch route.sourceType {
 	case "http":
-		payload, err = s.gateway.CallHTTPConnectionTool(ctx, route.connection, route.originalName, arguments)
+		payload, err = s.gateway.CallHTTPConnectionTool(callCtx, route.connection, route.originalName, arguments)
 	case "sse":
-		payload, err = s.gateway.CallSSEConnectionTool(ctx, route.connection, route.originalName, arguments)
+		payload, err = s.gateway.CallSSEConnectionTool(callCtx, route.connection, route.originalName, arguments)
 	case "stdio":
-		payload, err = s.gateway.CallStdioConnectionTool(ctx, botID, route.connection, route.originalName, arguments)
+		payload, err = s.gateway.CallStdioConnectionTool(callCtx, botID, route.connection, route.originalName, arguments)
 	default:
 		return mcpgw.BuildToolErrorResult("unsupported federated source"), nil
 	}
@@ -140,14 +185,14 @@ func (s *Source) buildToolsAndRoutes(ctx context.Context, botID string) ([]mcpgw
 			return
 		}
 		finalName := name
-		if _, exists := routes[finalName]; exists {
+		if _, exists := routes[finalName]; exists || s.isReservedToolName(finalName) {
 			seed := strings.ReplaceAll(finalName, ".", "_")
 			if seed == "" {
 				seed = "tool"
 			}
 			for i := 2; ; i++ {
 				candidate := seed + "_" + strconv.Itoa(i)
-				if _, ok := routes[candidate]; ok {
+				if _, ok := routes[candidate]; ok || s.isReservedToolName(candidate) {
 					continue
 				}
 				finalName = candidate
@@ -162,7 +207,7 @@ func (s *Source) buildToolsAndRoutes(ctx context.Context, botID string) ([]mcpgw
 	if s.connections != nil {
 		items, err := s.connections.ListActiveByBot(ctx, botID)
 		if err != nil {
-			s.logger.Warn("list mcp connections failed", slog.String("bot_id", botID), slog.Any("error", err))
+			s.logger.WarnContext(ctx, "list mcp connections failed", slog.String("bot_id", botID), slog.Any("error", err))
 		} else {
 			sort.Slice(items, func(i, j int) bool {
 				if items[i].Name == items[j].Name {
@@ -172,19 +217,22 @@ func (s *Source) buildToolsAndRoutes(ctx context.Context, botID string) ([]mcpgw
 			})
 			for _, connection := range items {
 				var connTools []mcpgw.ToolDescriptor
+				listCtx, listCancel := context.WithTimeout(ctx, mcpCallTimeout)
 				switch strings.ToLower(strings.TrimSpace(connection.Type)) {
 				case "http":
-					connTools, err = s.gateway.ListHTTPConnectionTools(ctx, connection)
+					connTools, err = s.gateway.ListHTTPConnectionTools(listCtx, connection)
 				case "sse":
-					connTools, err = s.gateway.ListSSEConnectionTools(ctx, connection)
+					connTools, err = s.gateway.ListSSEConnectionTools(listCtx, connection)
 				case "stdio":
-					connTools, err = s.gateway.ListStdioConnectionTools(ctx, botID, connection)
+					connTools, err = s.gateway.ListStdioConnectionTools(listCtx, botID, connection)
 				default:
-					s.logger.Warn("unsupported mcp connection type", slog.String("connection_id", connection.ID), slog.String("type", connection.Type))
+					listCancel()
+					s.logger.WarnContext(ctx, "unsupported mcp connection type", slog.String("connection_id", connection.ID), slog.String("type", connection.Type))
 					continue
 				}
+				listCancel()
 				if err != nil {
-					s.logger.Warn("list tools from connection failed", slog.String("connection_id", connection.ID), slog.String("name", connection.Name), slog.Any("error", err))
+					s.logger.WarnContext(ctx, "list tools from connection failed", slog.String("connection_id", connection.ID), slog.String("name", connection.Name), slog.Any("error", err))
 					continue
 				}
 				prefix := sanitizePrefix(connection.Name)
@@ -192,7 +240,7 @@ func (s *Source) buildToolsAndRoutes(ctx context.Context, botID string) ([]mcpgw
 					origin := strings.TrimSpace(tool.Name)
 					alias := origin
 					if prefix != "" {
-						alias = prefix + "." + origin
+						alias = prefix + "_" + origin
 					}
 					tool.Name = alias
 					if strings.TrimSpace(tool.Description) != "" {
@@ -210,6 +258,13 @@ func (s *Source) buildToolsAndRoutes(ctx context.Context, botID string) ([]mcpgw
 		}
 	}
 	return tools, routes
+}
+
+func (s *Source) isReservedToolName(name string) bool {
+	if s == nil || s.reserved == nil {
+		return false
+	}
+	return s.reserved(strings.TrimSpace(name))
 }
 
 func sanitizePrefix(raw string) string {

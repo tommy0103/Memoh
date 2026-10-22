@@ -1,0 +1,511 @@
+package application
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+
+	sessionruntime "github.com/felinics/memoh/internal/agent/runtime/session"
+	turnpkg "github.com/felinics/memoh/internal/agent/turn"
+	chatview "github.com/felinics/memoh/internal/agent/view"
+	"github.com/felinics/memoh/internal/apperror"
+	messagepkg "github.com/felinics/memoh/internal/chat/message"
+)
+
+type RetryLatestMessageInput struct {
+	BotID        string
+	SessionID    string
+	RunID        string
+	TurnID       string
+	TurnPosition *int64
+	// TargetTurnID names the round being replaced. It is distinct from TurnID,
+	// which names the new turn this operation admits.
+	TargetTurnID           string
+	ActorChannelIdentityID string
+	ActorUserID            string
+	ChatToken              string
+	Model                  string
+	ReasoningEffort        string
+	WorkspaceTargetID      string
+	ToolHTTPURL            string
+	// RunHandle and InjectCh are server-owned admission capabilities. They are
+	// populated only by the in-process Web runtime, never by client JSON.
+	RunHandle sessionruntime.RunHandle
+	InjectCh  chan turnpkg.InjectMessage
+	// OnModelPreferenceSettled releases subsequent picker writes once this
+	// turn's preference write-back has finished (issue #879). Same contract
+	// as ChatRequest.OnModelPreferenceSettled.
+	OnModelPreferenceSettled func()
+}
+
+type EditLatestMessageInput struct {
+	BotID        string
+	SessionID    string
+	RunID        string
+	TurnID       string
+	TurnPosition *int64
+	// TargetTurnID names the round being replaced. See RetryLatestMessageInput.
+	TargetTurnID           string
+	Text                   string
+	Attachments            []ChatAttachment
+	ActorChannelIdentityID string
+	ActorUserID            string
+	ChatToken              string
+	Model                  string
+	ReasoningEffort        string
+	WorkspaceTargetID      string
+	ToolHTTPURL            string
+	RunHandle              sessionruntime.RunHandle
+	InjectCh               chan turnpkg.InjectMessage
+	// OnModelPreferenceSettled: see RetryLatestMessageInput.
+	OnModelPreferenceSettled func()
+}
+
+func (s *Service) RetryLatestMessageWS(ctx context.Context, input RetryLatestMessageInput, eventCh chan<- WSStreamEvent, abortCh <-chan struct{}) (RunOutcome, error) {
+	sessionID := strings.TrimSpace(input.SessionID)
+	turn, cutoffMessageID, err := s.prepareRetryLatestTurnOperation(ctx, sessionID, strings.TrimSpace(input.TargetTurnID))
+	if err != nil {
+		return RunOutcome{}, err
+	}
+	requestMessageID := strings.TrimSpace(turn.RequestMessageID)
+	requestMessage, err := s.messageService.GetByIDBySession(ctx, sessionID, requestMessageID)
+	if err != nil {
+		return RunOutcome{}, err
+	}
+	if !strings.EqualFold(requestMessage.Role, "user") {
+		return RunOutcome{}, errors.New("retry target request is not a user message")
+	}
+	assistantMessage, err := s.messageService.GetByIDBySession(ctx, sessionID, strings.TrimSpace(turn.AssistantMessageID))
+	if err != nil {
+		return RunOutcome{}, err
+	}
+	retryUserMessageHook := isPreflightUserMessageHookFailure(assistantMessage)
+	persistedUserMessageID := requestMessage.ID
+	if retryUserMessageHook {
+		persistedUserMessageID = ""
+	}
+
+	req := ChatRequest{
+		BotID:                        strings.TrimSpace(input.BotID),
+		ChatID:                       strings.TrimSpace(input.BotID),
+		ThreadID:                     sessionID,
+		RunID:                        strings.TrimSpace(input.RunID),
+		RunHandle:                    input.RunHandle,
+		TurnID:                       strings.TrimSpace(input.TurnID),
+		TurnPosition:                 input.TurnPosition,
+		UserID:                       strings.TrimSpace(input.ActorUserID),
+		SourceChannelIdentityID:      strings.TrimSpace(input.ActorChannelIdentityID),
+		ConversationType:             turnpkg.ConversationTypePrivate,
+		Query:                        visibleMessageText(requestMessage),
+		RawQuery:                     visibleMessageText(requestMessage),
+		Token:                        strings.TrimSpace(input.ChatToken),
+		ChatToken:                    strings.TrimSpace(input.ChatToken),
+		CurrentChannel:               "local",
+		ReplyTarget:                  strings.TrimSpace(input.BotID),
+		Channels:                     []string{"local"},
+		Model:                        strings.TrimSpace(input.Model),
+		ReasoningEffort:              strings.TrimSpace(input.ReasoningEffort),
+		WorkspaceTargetID:            strings.TrimSpace(input.WorkspaceTargetID),
+		ToolHTTPURL:                  strings.TrimSpace(input.ToolHTTPURL),
+		InjectCh:                     input.InjectCh,
+		QueueSteerEnabled:            input.InjectCh != nil,
+		ReusePersistedUserMessage:    !retryUserMessageHook,
+		PersistedUserMessageID:       persistedUserMessageID,
+		HistoryCutoffBeforeMessageID: cutoffMessageID,
+		RequiredHistoryMessageID:     requestMessage.ID,
+		OnModelPreferenceSettled:     input.OnModelPreferenceSettled,
+	}
+	return s.streamReplacementWS(ctx, req, turn.ID, persistedUserMessageID, "retry", eventCh, abortCh)
+}
+
+func isPreflightUserMessageHookFailure(message messagepkg.Message) bool {
+	return message.Metadata != nil &&
+		message.Metadata[messagepkg.HistoryFailureOriginMetadataKey] == messagepkg.HistoryFailureOriginUserMessageHook
+}
+
+func (s *Service) EditLatestMessageWS(ctx context.Context, input EditLatestMessageInput, eventCh chan<- WSStreamEvent, abortCh <-chan struct{}) (RunOutcome, error) {
+	sessionID := strings.TrimSpace(input.SessionID)
+	text := strings.TrimSpace(input.Text)
+	if text == "" && len(input.Attachments) == 0 {
+		return RunOutcome{}, errors.New("message text or attachments required")
+	}
+
+	turn, err := s.prepareEditLatestTurnOperation(ctx, sessionID, strings.TrimSpace(input.TargetTurnID))
+	if err != nil {
+		return RunOutcome{}, err
+	}
+
+	req := ChatRequest{
+		BotID:                        strings.TrimSpace(input.BotID),
+		ChatID:                       strings.TrimSpace(input.BotID),
+		ThreadID:                     sessionID,
+		RunID:                        strings.TrimSpace(input.RunID),
+		RunHandle:                    input.RunHandle,
+		TurnID:                       strings.TrimSpace(input.TurnID),
+		TurnPosition:                 input.TurnPosition,
+		UserID:                       strings.TrimSpace(input.ActorUserID),
+		SourceChannelIdentityID:      strings.TrimSpace(input.ActorChannelIdentityID),
+		ConversationType:             turnpkg.ConversationTypePrivate,
+		Query:                        text,
+		RawQuery:                     text,
+		Token:                        strings.TrimSpace(input.ChatToken),
+		ChatToken:                    strings.TrimSpace(input.ChatToken),
+		CurrentChannel:               "local",
+		ReplyTarget:                  strings.TrimSpace(input.BotID),
+		Channels:                     []string{"local"},
+		Attachments:                  input.Attachments,
+		Model:                        strings.TrimSpace(input.Model),
+		ReasoningEffort:              strings.TrimSpace(input.ReasoningEffort),
+		WorkspaceTargetID:            strings.TrimSpace(input.WorkspaceTargetID),
+		ToolHTTPURL:                  strings.TrimSpace(input.ToolHTTPURL),
+		InjectCh:                     input.InjectCh,
+		QueueSteerEnabled:            input.InjectCh != nil,
+		HistoryCutoffBeforeMessageID: strings.TrimSpace(turn.RequestMessageID),
+		OnModelPreferenceSettled:     input.OnModelPreferenceSettled,
+	}
+	return s.streamReplacementWS(ctx, req, turn.ID, "", "edit", eventCh, abortCh)
+}
+
+// PrepareRetryLatestTurnOperation validates the replacement target before
+// Session Runtime publishes it to subscribers and returns the exact persisted
+// user message where the replaced turn begins. A retry now has its own user
+// row, so the live projection replaces the old request as well as its output.
+func (s *Service) PrepareRetryLatestTurnOperation(ctx context.Context, sessionID, turnID string) (string, error) {
+	turn, _, err := s.prepareRetryLatestTurnOperation(ctx, strings.TrimSpace(sessionID), strings.TrimSpace(turnID))
+	return strings.TrimSpace(turn.RequestMessageID), err
+}
+
+// PrepareRetryRequestUserTurn projects the validated request for admission.
+// Its assets already belong to history and must not be ingested a second time.
+// Admission assigns the new turn identity; the first committed step assigns
+// the retry's durable request identity.
+func (s *Service) PrepareRetryRequestUserTurn(ctx context.Context, sessionID, requestMessageID string) (*chatview.UITurn, error) {
+	request, err := s.messageService.GetByIDBySession(ctx, strings.TrimSpace(sessionID), strings.TrimSpace(requestMessageID))
+	if err != nil {
+		return nil, err
+	}
+	turns := chatview.ConvertMessagesToUITurns([]messagepkg.Message{request})
+	if len(turns) != 1 || !strings.EqualFold(strings.TrimSpace(turns[0].Role), "user") {
+		return nil, errors.New("retry target request is not a visible user message")
+	}
+	return &turns[0], nil
+}
+
+func (s *Service) prepareRetryLatestTurnOperation(ctx context.Context, sessionID, turnID string) (messagepkg.HistoryTurn, string, error) {
+	turn, err := s.resolveLatestVisibleTurn(ctx, sessionID, turnID, "only the latest assistant message can be retried")
+	if err != nil {
+		return messagepkg.HistoryTurn{}, "", err
+	}
+	if strings.TrimSpace(turn.RequestMessageID) == "" {
+		return messagepkg.HistoryTurn{}, "", errors.New("retry target has no request message")
+	}
+	// The turn's own assistant anchor, not a message the client named: a turn
+	// that reached the client without one is a history the server cannot cut.
+	// The request message is still there, so the client may edit instead.
+	replaceFromMessageID := strings.TrimSpace(turn.AssistantMessageID)
+	if replaceFromMessageID == "" {
+		return messagepkg.HistoryTurn{}, "", apperror.Wrap(
+			apperror.CodeSessionTurnIncomplete,
+			fmt.Errorf("turn %s has no assistant anchor", turn.ID),
+			nil,
+		)
+	}
+	return turn, replaceFromMessageID, nil
+}
+
+// PrepareEditLatestTurnOperation validates the replacement target before
+// Session Runtime publishes it to subscribers and returns the exact persisted
+// user message where the old turn begins.
+func (s *Service) PrepareEditLatestTurnOperation(ctx context.Context, sessionID, turnID string) (string, error) {
+	turn, err := s.prepareEditLatestTurnOperation(ctx, strings.TrimSpace(sessionID), strings.TrimSpace(turnID))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(turn.RequestMessageID), nil
+}
+
+func (s *Service) prepareEditLatestTurnOperation(ctx context.Context, sessionID, turnID string) (messagepkg.HistoryTurn, error) {
+	turn, err := s.resolveLatestVisibleTurn(ctx, sessionID, turnID, "only the latest user message can be edited")
+	if err != nil {
+		return messagepkg.HistoryTurn{}, err
+	}
+	// The turn's request message is by construction its leading user message,
+	// so naming the turn already names what an edit replaces.
+	if strings.TrimSpace(turn.RequestMessageID) == "" {
+		return messagepkg.HistoryTurn{}, errors.New("edit target has no request message")
+	}
+	return turn, nil
+}
+
+// ResolveTurnIDForMessage maps a stored message id onto the round that contains
+// it. It backs the compatibility shim for the pre-turn `message_id` spelling
+// and has no other caller: a client holds a turn id from admission onward and
+// names the round directly, while needing a stored message id is exactly what
+// used to force it to wait for the round to persist.
+//
+// Remove it, and the shim, once the compatibility window for `message_id`
+// closes. (Not marked Deprecated in the godoc sense — the shim is its intended
+// caller, so flagging that call adds noise rather than signal.)
+func (s *Service) ResolveTurnIDForMessage(ctx context.Context, sessionID, messageID string) (string, error) {
+	if s == nil || s.messageService == nil {
+		return "", errors.New("message service not configured")
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	messageID = strings.TrimSpace(messageID)
+	if sessionID == "" {
+		return "", errors.New("session id is required")
+	}
+	if messageID == "" {
+		return "", errors.New("message id is required")
+	}
+	turn, err := s.messageService.GetVisibleTurnByMessage(ctx, sessionID, messageID)
+	if err != nil {
+		return "", fmt.Errorf("load visible turn: %w", err)
+	}
+	turnID := strings.TrimSpace(turn.ID)
+	if turnID == "" {
+		return "", errors.New("message has no visible turn")
+	}
+	return turnID, nil
+}
+
+// resolveLatestVisibleTurn answers which round the client named, from the turn
+// alone. Retry and edit can only ever address the moving tail, so "is this the
+// latest visible turn" is the entire validation; the turn then carries its own
+// canonical request/assistant message ids, which is why no message lookup is
+// needed to find the round.
+//
+// The turn is also the only identity both sides hold at the same time. A turn
+// id is minted at admission and reaches the client while the run is still
+// streaming, whereas a database message id exists only once the round is
+// persisted — keying on the turn is what lets a live round be retried or
+// edited without first waiting for its stored twin to arrive.
+func (s *Service) resolveLatestVisibleTurn(ctx context.Context, sessionID, turnID, notLatest string) (messagepkg.HistoryTurn, error) {
+	if s == nil || s.messageService == nil {
+		return messagepkg.HistoryTurn{}, errors.New("message service not configured")
+	}
+	if sessionID == "" {
+		return messagepkg.HistoryTurn{}, errors.New("session id is required")
+	}
+	if turnID == "" {
+		return messagepkg.HistoryTurn{}, errors.New("turn id is required")
+	}
+	latest, err := s.messageService.GetLatestVisibleTurnBySession(ctx, sessionID)
+	if err != nil {
+		// A session with no visible turn at all and a session whose latest turn
+		// is a different one are the same answer to the client: the round it
+		// named is not the one the server can replace, so it has to reload.
+		// Both are stale-client conflicts, not history faults, and are reported
+		// with the 409 code instead of the store's own wording.
+		if errors.Is(err, messagepkg.ErrNoVisibleTurn) {
+			return messagepkg.HistoryTurn{}, apperror.Wrap(apperror.CodeSessionTurnNotLatest, err, nil)
+		}
+		return messagepkg.HistoryTurn{}, fmt.Errorf("load latest visible turn: %w", err)
+	}
+	if strings.TrimSpace(latest.ID) != turnID {
+		return messagepkg.HistoryTurn{}, apperror.Wrap(apperror.CodeSessionTurnNotLatest, errors.New(notLatest), nil)
+	}
+	return latest, nil
+}
+
+func (s *Service) ensureLatestVisibleTurn(ctx context.Context, sessionID, turnID string) error {
+	_, err := s.resolveLatestVisibleTurn(ctx, sessionID, strings.TrimSpace(turnID), "turn is not latest")
+	return err
+}
+
+func (s *Service) streamReplacementWS(
+	ctx context.Context,
+	req ChatRequest,
+	oldTurnID string,
+	requestMessageID string,
+	reason string,
+	eventCh chan<- WSStreamEvent,
+	abortCh <-chan struct{},
+) (RunOutcome, error) {
+	replacement := &messagepkg.TurnReplacement{
+		OldTurnID:               strings.TrimSpace(oldTurnID),
+		ReplacementTurnID:       strings.TrimSpace(req.TurnID),
+		ReplacementTurnPosition: req.TurnPosition,
+		RequestMessageID:        strings.TrimSpace(requestMessageID),
+		Reason:                  strings.TrimSpace(reason),
+	}
+	if update := s.prepareForkAnchorUpdate(ctx, req.ThreadID, req.HistoryCutoffBeforeMessageID); update != nil {
+		replacement.SessionMetadata = update.metadata
+	}
+	req.TurnReplacement = replacement
+	_, outcome, err := s.streamChatWSResultWithHooks(
+		ctx,
+		req,
+		eventCh,
+		abortCh,
+		func(ctx context.Context) error {
+			return s.ensureLatestVisibleTurn(ctx, req.ThreadID, oldTurnID)
+		},
+		nil,
+	)
+	return outcome, err
+}
+
+type forkAnchorUpdate struct {
+	metadata map[string]any
+}
+
+func (s *Service) prepareForkAnchorUpdate(ctx context.Context, sessionID string, replacedTailStartMessageID string) *forkAnchorUpdate {
+	sessionID = strings.TrimSpace(sessionID)
+	replacedTailStartMessageID = strings.TrimSpace(replacedTailStartMessageID)
+	if s == nil || s.sessionService == nil || s.messageService == nil || sessionID == "" || replacedTailStartMessageID == "" {
+		return nil
+	}
+
+	sess, err := s.sessionService.Get(ctx, sessionID)
+	if err != nil {
+		s.logForkAnchorUpdateWarning("load session for fork anchor update failed", sessionID, err)
+		return nil
+	}
+	fork, ok := forkedFromMetadata(sess.Metadata)
+	if !ok {
+		return nil
+	}
+	currentAnchor := forkMetadataString(fork, "fork_message_id")
+	if currentAnchor == "" {
+		return nil
+	}
+
+	replacedTail, err := s.messageService.ListVisibleFromBySession(ctx, sessionID, replacedTailStartMessageID)
+	if err != nil {
+		s.logForkAnchorUpdateWarning("load replaced tail for fork anchor update failed", sessionID, err)
+		return nil
+	}
+	if !messagesContainAnchor(replacedTail, currentAnchor) {
+		return nil
+	}
+
+	nextAnchor := s.latestInheritedAssistantBefore(ctx, sessionID, replacedTailStartMessageID)
+	if nextAnchor == currentAnchor {
+		return nil
+	}
+
+	nextFork := cloneMetadataMap(fork)
+	if nextAnchor != "" {
+		nextFork["fork_message_id"] = nextAnchor
+	} else {
+		delete(nextFork, "fork_message_id")
+	}
+
+	nextMetadata := cloneMetadataMap(sess.Metadata)
+	nextMetadata["forked_from"] = nextFork
+	return &forkAnchorUpdate{metadata: nextMetadata}
+}
+
+func (s *Service) latestInheritedAssistantBefore(ctx context.Context, sessionID string, beforeMessageID string) string {
+	messages, err := s.messageService.ListBeforeMessageBySession(ctx, sessionID, beforeMessageID, 10000)
+	if err != nil {
+		s.logForkAnchorUpdateWarning("load previous messages for fork anchor update failed", sessionID, err)
+		return ""
+	}
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		if !strings.EqualFold(strings.TrimSpace(msg.Role), "assistant") {
+			continue
+		}
+		return strings.TrimSpace(msg.ID)
+	}
+	return ""
+}
+
+func messagesContainAnchor(messages []messagepkg.Message, anchor string) bool {
+	anchor = strings.TrimSpace(anchor)
+	if anchor == "" {
+		return false
+	}
+	for _, msg := range messages {
+		if strings.TrimSpace(msg.ID) == anchor || strings.TrimSpace(msg.ExternalMessageID) == anchor {
+			return true
+		}
+	}
+	return false
+}
+
+func forkedFromMetadata(metadata map[string]any) (map[string]any, bool) {
+	raw, ok := metadata["forked_from"]
+	if !ok || raw == nil {
+		return nil, false
+	}
+	switch value := raw.(type) {
+	case map[string]any:
+		return value, true
+	case map[string]string:
+		out := make(map[string]any, len(value))
+		for key, item := range value {
+			out[key] = item
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func forkMetadataString(metadata map[string]any, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	value, ok := metadata[key]
+	if !ok || value == nil {
+		return ""
+	}
+	if text, ok := value.(string); ok {
+		return strings.TrimSpace(text)
+	}
+	return strings.TrimSpace(fmt.Sprint(value))
+}
+
+func cloneMetadataMap(metadata map[string]any) map[string]any {
+	if metadata == nil {
+		return map[string]any{}
+	}
+	out := make(map[string]any, len(metadata))
+	for key, value := range metadata {
+		out[key] = value
+	}
+	return out
+}
+
+func (s *Service) logForkAnchorUpdateWarning(message string, sessionID string, err error) {
+	if s != nil && s.logger != nil {
+		s.logger.Warn("fork anchor update skipped", slog.String("reason", message), slog.String("session_id", sessionID), slog.Any("error", err))
+	}
+}
+
+func (s *Service) cleanupReplacementMessages(ctx context.Context, persisted []messagepkg.Message) {
+	if s == nil || s.messageService == nil || len(persisted) == 0 {
+		return
+	}
+	ids := make([]string, 0, len(persisted))
+	for _, msg := range persisted {
+		if id := strings.TrimSpace(msg.ID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+	if err := s.messageService.DeleteByIDs(context.WithoutCancel(ctx), ids); err != nil {
+		s.logger.ErrorContext(ctx, "cleanup replacement messages failed", slog.Any("error", err), slog.Int("message_count", len(ids)))
+	}
+}
+
+func visibleMessageText(msg messagepkg.Message) string {
+	if text := strings.TrimSpace(msg.DisplayContent); text != "" {
+		return text
+	}
+	var modelMessage ModelMessage
+	if err := json.Unmarshal(msg.Content, &modelMessage); err == nil {
+		if text := strings.TrimSpace(modelMessage.TextContent()); text != "" {
+			return text
+		}
+	}
+	return strings.TrimSpace(string(msg.Content))
+}

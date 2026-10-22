@@ -1,0 +1,129 @@
+version: "2"
+
+run:
+  timeout: 15m
+  go: "1.25"
+  tests: true
+
+output:
+  show-stats: false
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+linters:
+  default: none
+  enable:
+    - bodyclose
+    - contextcheck
+    - depguard
+    - errcheck
+    - errorlint
+    - exptostd
+    - fatcontext
+    - gocritic
+    - gosec
+    - godot
+    - govet
+    - ineffassign
+    - misspell
+    - noctx
+    - nilnesserr
+    - perfsprint
+    - predeclared
+    - revive
+    - sqlclosecheck
+    - sloglint
+    - staticcheck
+    - testifylint
+    - unconvert
+    - unused
+    - usestdlibvars
+    - whitespace
+  exclusions:
+    generated: lax
+    paths:
+      - internal/db/postgres/sqlc
+      - ^.*\.(pb|l|y)\.go$
+  settings:
+    depguard:
+      rules:
+        # Packages that return package errors. The public error is chosen by
+        # the translation function of the caller, see docs/errors.md.
+        package-errors:
+          files:
+            - "**/internal/agent/runtime/acp/**"
+            - "**/internal/agent/runtime/claudecode/**"
+            - "**/internal/agent/runtime/codex/**"
+            - "**/internal/agent/runtime/external/**"
+            - "**/internal/agent/runtime/native/**"
+            - "**/internal/agent/runtime/toolmount/**"
+            - "**/internal/models/**"
+            - "**/internal/providers/**"
+            - "**/internal/providertemplates/**"
+            - "**/internal/searchproviders/**"
+            - "**/internal/supermarket/**"
+          deny:
+            - pkg: github.com/felinics/memoh/internal/apperror
+              desc: return a package error; the caller's translation function chooses the public error (docs/errors.md)
+    govet:
+      enable-all: true
+      disable:
+        - shadow
+        - fieldalignment
+    gocyclo:
+      min-complexity: 10
+    funlen:
+      lines: 60
+      statements: 30
+    perfsprint:
+      int-conversion: true
+      err-error: true
+      errorf: true
+      sprintf1: true
+      strconcat: false
+    revive:
+      rules:
+        - name: blank-imports
+        - name: comment-spacings
+        - name: context-as-argument
+          arguments:
+            - allowTypesBefore: "*testing.T,testing.TB"
+        - name: dot-imports
+        - name: error-naming
+        - name: error-return
+        - name: error-strings
+        - name: increment-decrement
+        - name: var-declaration
+        - name: unreachable-code
+        - name: unused-parameter
+        - name: unused-receiver
+    sloglint:
+      attr-only: true
+      no-global: default
+      static-msg: true
+      key-naming-case: snake
+      forbidden-keys: [time, level, msg, source]
+    testifylint:
+      enable-all: true
+      disable:
+        - float-compare
+        - go-require
+
+formatters:
+  enable:
+    - gci
+    - gofumpt
+    - goimports
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(github.com/felinics/memoh)
+    gofumpt:
+      extra-rules: false
+    goimports:
+      local-prefixes:
+        - github.com/felinics/memoh

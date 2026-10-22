@@ -4,9 +4,9 @@ import (
 	"strings"
 	"testing"
 
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	tele "gopkg.in/telebot.v4"
 
-	"github.com/memohai/memoh/internal/channel"
+	"github.com/felinics/memoh/internal/channel"
 )
 
 func TestMarkdownToTelegramHTML(t *testing.T) {
@@ -21,6 +21,12 @@ func TestMarkdownToTelegramHTML(t *testing.T) {
 			input:    "this is **bold** text",
 			contains: []string{"<b>bold</b>"},
 			absent:   []string{"**"},
+		},
+		{
+			name:     "backticked model id with special chars renders as safe code",
+			input:    "Current model: `deepseek/deepseek-v4-flash:free_x` and `a<b*c`",
+			contains: []string{"<code>deepseek/deepseek-v4-flash:free_x</code>", "<code>a&lt;b*c</code>"},
+			absent:   []string{"<i>", "<b>", "&lt;b&gt;"},
 		},
 		{
 			name:     "italic",
@@ -149,7 +155,7 @@ func TestFormatTelegramOutput(t *testing.T) {
 			name:         "markdown format returns html mode",
 			text:         "**bold**",
 			format:       channel.MessageFormatMarkdown,
-			wantMode:     tgbotapi.ModeHTML,
+			wantMode:     tele.ModeHTML,
 			wantContains: "<b>bold</b>",
 		},
 		{

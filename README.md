@@ -1,92 +1,129 @@
 <div align="right">
   <span>[<a href="./README.md">English</a>]<span>
   </span>[<a href="./README_CN.md">简体中文</a>]</span>
+  </span>[<a href="./README_JA.md">日本語</a>]</span>
 </div>  
 
 <div align="center">
-  <img src="./assets/logo.png" alt="Memoh" width="100" height="100">
+  <img src="./assets/logo.png" alt="Memoh" height="80">
   <h1>Memoh</h1>
-  <p>Multi-Member, Structured Long-Memory, Containerized AI Agent System.</p>
-  <p>📌 <a href="https://docs.memoh.ai/blogs/2026-02-16.html">Introduction to Memoh - The Case for an Always-On, Containerized Home Agent</a></p>
+  <p>Give every AI agent its own cloud computer. Open source.<br>
+  Desktop, browser, network, and long-term memory — always on, even when your laptop is closed.</p>
   <div align="center">
-    <img src="https://img.shields.io/github/package-json/v/memohai/Memoh" alt="Version" />
-    <img src="https://img.shields.io/github/license/memohai/Memoh" alt="License" />
-    <img src="https://img.shields.io/github/stars/memohai/Memoh?style=social" alt="Stars" />
-    <img src="https://img.shields.io/github/forks/memohai/Memoh?style=social" alt="Forks" />
-    <img src="https://img.shields.io/github/last-commit/memohai/Memoh" alt="Last Commit" />
-    <img src="https://img.shields.io/github/issues/memohai/Memoh" alt="Issues" />
+    <img src="https://img.shields.io/github/package-json/v/felinics/Memoh" alt="Version" />
+    <img src="https://img.shields.io/github/stars/felinics/Memoh?style=social" alt="Stars" />
+    <img src="https://img.shields.io/github/forks/felinics/Memoh?style=social" alt="Forks" />
+    <a href="https://deepwiki.com/felinics/Memoh">
+      <img src="https://deepwiki.com/badge.svg" alt="DeepWiki" />
+    </a>
+    <a href="https://t.me/memohai">
+      <img src="https://img.shields.io/badge/Telegram-Group-26A5E4?logo=telegram&logoColor=white" alt="Telegram" />
+    </a>
   </div>
-  <div align="center">
-    [<a href="https://t.me/memohai">Telegram Group</a>]
-    [<a href="https://docs.memoh.ai">Documentation</a>]
-    [<a href="mailto:business@memoh.net">Cooperation</a>]
-  </div>
-  <hr>
+  <h3>
+    <a href="https://app.memoh.net">Login</a> · <a href="#self-hosted">Self-hosted</a> · <a href="https://docs.memoh.ai">Docs</a> · <a href="https://memoh.ai">Website</a> · <a href="https://x.com/memoh_ai">X</a>
+  </h3>
+  <img src="./assets/hero.png" alt="Memoh" width="1000">
 </div>
 
+## What is Memoh?
 
+Memoh is an open-source multi-agent platform. Each agent gets its own cloud computer — a dedicated workspace with a filesystem, desktop, browser, network, and long-term memory. Your agents stay online 24/7, even when your laptop is closed.
 
-Memoh is a AI agent system platform. Users can create their own AI bots and chat with them via Telegram, Discord, Lark(Feishu), etc. Every bot has independent container and memory system which allows them to edit files, execute commands and build themselves - Like [OpenClaw](https://openclaw.ai), Memoh provides a more secure, flexible and scalable solution for multi-bot management.
+Use your own API keys to run Memoh's built-in agent, or host your existing Claude Code and Codex agents inside Memoh workspaces.
 
-## Quick Start
+Talk to them through Telegram, Discord, Lark, WeChat, Web UI, and more. They remember context across sessions and platforms, drive a browser, call MCP tools, and run scheduled tasks. Run one for yourself, assign one to each team member, or spin up a fleet.
 
-One-click install (**requires [Docker](https://www.docker.com/get-started/)**):
+## Get Started
+
+### Memoh Cloud
+
+You can now sign up or log in directly at [app.memoh.net](https://app.memoh.net).
+
+### Self-hosted
+
+Self-host the full stack on your own infrastructure.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/memohai/Memoh/main/scripts/install.sh | sh
+curl -fsSL https://memoh.sh | sh
 ```
 
-*Silent install with all defaults: `curl -fsSL ... | sh -s -- -y`*
+<details>
+<summary><strong>More deployment options</strong></summary>
 
-Or manually:
+Manual deployment:
 
 ```bash
-git clone --depth 1 https://github.com/memohai/Memoh.git
+git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/felinics/Memoh.git
 cd Memoh
+cp conf/app.docker.toml config.toml
+# Edit config.toml
+export MEMOH_INTERNAL_RPC_SHARED_SECRET="$(openssl rand -hex 32)"
 docker compose up -d
 ```
 
-Visit <http://localhost:8082> after startup. Default login: `admin` / `admin123`
+The Compose stack runs Server and Channel as separate services. Keep the internal RPC secret private and use the same value whenever the stack is recreated.
+
+In split deployments, Channel streams media through authenticated internal Storage RPC. Only Server needs access to the workspace and media storage. Upgrade Server before Channel so the Storage service is available.
+
+Running without Docker (or upgrading an existing bare-metal install)? Leave `internal_rpc.shared_secret` empty in `config.toml`: the server then embeds the channel runtime and keeps running as a single all-in-one process — external channels, and webhook endpoints included — with no `memoh-channel` process required. Setting the secret opts into the split two-process deployment.
+
+Existing setup checkouts can keep using `git pull`: the post-merge hook initializes the new
+submodule, and setup enables recursive updates for future pulls. If that hook was never installed,
+run `mise run submodule-init` once after upgrading.
+GitHub's automatic “Source code” archives omit submodule contents. For a buildable release archive,
+use the attached `Memoh-<version>-source.zip` or `.tar.gz` asset instead.
+
+> **Use CN mirror for slow image pulls:**
+> ```bash
+> curl -fsSL https://memoh.sh | USE_CN_MIRROR=true sh
+> ```
+>
+> Do not run the whole installer with `sudo`. The installer will use `sudo docker`
+> internally if Docker requires it.
 
 See [DEPLOYMENT.md](DEPLOYMENT.md) for custom configuration and production setup.
 
+</details>
+
 ## Why Memoh?
 
-OpenClaw, Clawdbot, and Moltbot are impressive, but they have notable drawbacks: stability issues, security concerns, cumbersome configuration, and high token costs. If you're looking for a stable, secure Bot SaaS solution, consider our open-source Memoh.
+- **Every agent gets its own computer**: An isolated workspace with its own filesystem, network, desktop, and browser.
+- **Multi-user, multi-bot**: Run one for yourself, deploy one for each family member, run a fleet on a single machine.
+- **Lightweight**: Self-host the server on your own infrastructure, or connect through Memoh Cloud.
 
-Memoh is a multi-bot agent service built with Golang. It offers full graphical configuration for bots, Channels, MCP, and Skills. We use Containerd to provide container-level isolation for each bot and draw heavily from OpenClaw's Agent design.
+## Sub-projects
 
-Memoh Bot features a deeply engineered memory layer inspired by Mem0. By storing knowledge from each conversation turn, it enables more precise memory retrieval.
+- [**Twilight AI**](https://github.com/felinics/twilight) — A lightweight, idiomatic AI SDK for Go, inspired by [Vercel AI SDK](https://sdk.vercel.ai/). Provider-agnostic (OpenAI, Anthropic, Google), with first-class streaming, tool calling, MCP, and embeddings.
+- [**Connect It**](https://github.com/felinics/connect-it) — A self-hosted connector gateway that securely stores SaaS credentials and gives agents access to integrations through a single MCP endpoint.
+- [**UI**](https://github.com/felinics/ui) — A Vue 3 design system for AI agent management interfaces, including a component library, design tokens, and skills that teach agents how to use them.
 
-Memoh Bot can distinguish and remember requests from multiple humans and bots, working seamlessly in any group chat. You can use Memoh to build bot teams, or set up accounts for family members to manage daily household tasks with bots.
+## Project Status
 
-## Features
-- **Multi-bot Management**: Create multiple bots; humans and bots, or bots with each other, can chat privately, in groups, or collaborate.
-- **Containerized**: Each bot runs in its own isolated container. Bots can freely execute commands, edit files, and access the network within their containers—like having their own computer.
-- **Memory Engineering**: Every chat is stored in the database, with the last 24 hours of context loaded by default. Each conversation turn is stored as memory and can be retrieved by bots through semantic search.
-- **Various Platforms**: Supports Telegram, Lark (Feishu), and more.
-- **Simple and Easy to Use**: Configure bots and settings for Provider, Model, Memory, Channel, MCP, and Skills through a graphical interface—no coding required to set up your own AI bot.
-- **Scheduled Tasks**: Schedule tasks with cron expressions to run commands at specified times.
-- More...
-
-## Roadmap
-
-Please refer to the [Roadmap Version 0.1](https://github.com/memohai/Memoh/issues/2) for more details.
-
-### Development
-
-Refer to [CONTRIBUTING.md](CONTRIBUTING.md) for development setup.
+![License](https://img.shields.io/github/license/felinics/Memoh) ![Last Commit](https://img.shields.io/github/last-commit/felinics/Memoh) ![Commit Activity](https://img.shields.io/github/commit-activity/m/felinics/Memoh) ![Issues](https://img.shields.io/github/issues/felinics/Memoh) ![Pull Requests](https://img.shields.io/github/issues-pr/felinics/Memoh)
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=memohai/Memoh&type=date&legend=top-left)](https://www.star-history.com/#memohai/Memoh&type=date&legend=top-left)
+[![Star History Chart](https://star-history.dera.page/svg?repos=felinics/Memoh&type=date&legend=top-left)](https://star-history.dera.page/#felinics/Memoh&type=date&legend=top-left)
 
 ## Contributors
 
-<a href="https://github.com/memohai/Memoh/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=memohai/Memoh" />
+<a href="https://github.com/felinics/Memoh/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=felinics/Memoh" />
 </a>
+
+## Community
+
+- 🌐 [**Website**](https://memoh.ai)
+- 📚 [**Documentation**](https://docs.memoh.ai)
+- 💬 [**Telegram Group**](https://t.me/memohai)
+- 🛒 [**Supermarket**](https://github.com/felinics/supermarket)
+- 🤝 [**Cooperation**](mailto:business@memoh.net) — business@memoh.net
+
+---
 
 **LICENSE**: AGPLv3
 
-Copyright (C) 2026 Memoh. All rights reserved.
+Made with ❤️ by MemohAI Team,
+
+Copyright (C) 2026 MemohAI (memoh.ai). All rights reserved.

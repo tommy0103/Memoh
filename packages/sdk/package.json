@@ -1,6 +1,11 @@
 {
-  "name": "@memoh/sdk",
-  "version": "0.0.0",
+  "name": "@memohai/sdk",
+  "version": "0.22.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/felinics/Memoh.git",
+    "directory": "packages/sdk"
+  },
   "description": "",
   "exports": {
     ".": "./src/index.ts",
@@ -9,7 +14,7 @@
   },
   "main": "index.js",
   "scripts": {
-    
+    "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "packageManager": "pnpm@10.27.0",
   "peerDependencies": {

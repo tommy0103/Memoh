@@ -2,14 +2,20 @@ package handlers
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
-	"os"
 	"path"
-	"path/filepath"
 	"strings"
 
 	"github.com/labstack/echo/v4"
-	"gopkg.in/yaml.v3"
+
+	"github.com/felinics/memoh/internal/apperror"
+	"github.com/felinics/memoh/internal/bots"
+	"github.com/felinics/memoh/internal/errs"
+	skillset "github.com/felinics/memoh/internal/skills"
+	"github.com/felinics/memoh/internal/workspace"
+	"github.com/felinics/memoh/internal/workspace/bridge"
 )
 
 type SkillItem struct {
@@ -17,18 +23,45 @@ type SkillItem struct {
 	Description string         `json:"description"`
 	Content     string         `json:"content"`
 	Metadata    map[string]any `json:"metadata,omitempty"`
+	Raw         string         `json:"raw"`
+	SourcePath  string         `json:"source_path,omitempty"`
+	SourceRoot  string         `json:"source_root,omitempty"`
+	SourceKind  string         `json:"source_kind,omitempty"`
+	Managed     bool           `json:"managed,omitempty"`
+	Editable    bool           `json:"editable"`
+	Deletable   bool           `json:"deletable"`
+	State       string         `json:"state,omitempty"`
+	ShadowedBy  string         `json:"shadowed_by,omitempty"`
+	RegistryID  string         `json:"registry_id,omitempty"`
+	AppID       string         `json:"app_id,omitempty"`
+	SkillID     string         `json:"skill_id,omitempty"`
 }
 
 type SkillsResponse struct {
 	Skills []SkillItem `json:"skills"`
 }
 
+type SafeSkillsResponse struct {
+	Skills []skillset.SafeCatalogItem `json:"skills"`
+}
+
 type SkillsUpsertRequest struct {
-	Skills []SkillItem `json:"skills"`
+	Skills []string `json:"skills"`
+	// SourcePath is the existing SKILL.md being edited when saving a single skill.
+	// Empty means create (or overwrite by frontmatter name under
+	// /data/skills/<name>/).
+	SourcePath string `json:"source_path,omitempty"`
 }
 
 type SkillsDeleteRequest struct {
-	Names []string `json:"names"`
+	// SourcePaths are SKILL.md paths reported in the skill list. Deleting by name
+	// cannot address registry skills, which are nested by registry and app.
+	SourcePaths []string `json:"source_paths"`
+}
+
+type SkillsActionRequest struct {
+	Action     string `json:"action"`
+	TargetPath string `json:"target_path"`
 }
 
 type skillsOpResponse struct {
@@ -36,360 +69,522 @@ type skillsOpResponse struct {
 }
 
 // ListSkills godoc
-// @Summary List skills from data directory
+// @Summary List skills from the bot workspace
 // @Tags containerd
 // @Param bot_id path string true "Bot ID"
+// @Param workspace_target_id query string false "Workspace target ID"
 // @Success 200 {object} SkillsResponse
-// @Failure 400 {object} ErrorResponse
-// @Failure 404 {object} ErrorResponse
-// @Failure 500 {object} ErrorResponse
-// @Router /bots/{bot_id}/container/skills [get]
+// @Failure 400 {object} server.Problem
+// @Failure 403 {object} server.Problem
+// @Failure 404 {object} server.Problem
+// @Failure 500 {object} server.Problem
+// @Router /bots/{bot_id}/container/skills [get].
 func (h *ContainerdHandler) ListSkills(c echo.Context) error {
-	botID, err := h.requireBotAccess(c)
+	botID, err := h.requireBotAccessWithPermission(c, bots.PermissionManage)
 	if err != nil {
 		return err
 	}
-	skillsDir, err := h.ensureSkillsDirHost(botID)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-	}
-	entries, err := listSkillEntries(skillsDir)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-	}
 
-	skills := make([]SkillItem, 0, len(entries))
-	for _, entry := range entries {
-		skillPath, name := skillPathForEntry(entry)
-		if skillPath == "" {
-			continue
-		}
-		raw, err := h.readSkillFile(skillsDir, skillPath)
-		if err != nil {
-			continue
-		}
-		parsed := parseSkillFile(raw, name)
-		skills = append(skills, SkillItem{
-			Name:        parsed.Name,
-			Description: parsed.Description,
-			Content:     parsed.Content,
-			Metadata:    parsed.Metadata,
-		})
+	ctx := c.Request().Context()
+	if targetID := strings.TrimSpace(c.QueryParam("workspace_target_id")); targetID != "" {
+		ctx = bridge.WithWorkspaceTarget(ctx, targetID)
 	}
-
+	skills, err := h.listSkillsFromContainer(ctx, botID)
+	if err != nil {
+		return workspaceTargetHTTPError(err)
+	}
 	return c.JSON(http.StatusOK, SkillsResponse{Skills: skills})
 }
 
+// ListSafeSkills godoc
+// @Summary List runtime-safe skills for chat-time skill selection
+// @Tags skills
+// @Param bot_id path string true "Bot ID"
+// @Success 200 {object} SafeSkillsResponse
+// @Failure 400 {object} server.Problem
+// @Failure 403 {object} server.Problem
+// @Failure 404 {object} server.Problem
+// @Failure 500 {object} server.Problem
+// @Router /bots/{bot_id}/skills/catalog [get].
+func (h *ContainerdHandler) ListSafeSkills(c echo.Context) error {
+	botID, err := h.requireBotAccessWithPermission(c, bots.PermissionChat)
+	if err != nil {
+		return err
+	}
+	catalog, err := h.buildSafeSkillCatalog(c.Request().Context(), botID)
+	if err != nil {
+		return errs.Wrap(err, "build skill catalog")
+	}
+	return c.JSON(http.StatusOK, SafeSkillsResponse{Skills: catalog})
+}
+
 // UpsertSkills godoc
-// @Summary Upload skills into data directory
+// @Summary Upload skills into Memoh-managed directory
 // @Tags containerd
 // @Param bot_id path string true "Bot ID"
 // @Param payload body SkillsUpsertRequest true "Skills payload"
 // @Success 200 {object} skillsOpResponse
-// @Failure 400 {object} ErrorResponse
-// @Failure 404 {object} ErrorResponse
-// @Failure 500 {object} ErrorResponse
-// @Router /bots/{bot_id}/container/skills [post]
+// @Failure 400 {object} server.Problem
+// @Failure 409 {object} server.Problem
+// @Failure 404 {object} server.Problem
+// @Failure 500 {object} server.Problem
+// @Failure 503 {object} server.Problem
+// @Router /bots/{bot_id}/container/skills [post].
 func (h *ContainerdHandler) UpsertSkills(c echo.Context) error {
-	botID, err := h.requireBotAccess(c)
+	botID, err := h.requireBotAccessWithPermission(c, bots.PermissionWorkspaceWrite)
 	if err != nil {
 		return err
 	}
+
 	var req SkillsUpsertRequest
 	if err := c.Bind(&req); err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		return err
 	}
 	if len(req.Skills) == 0 {
-		return echo.NewHTTPError(http.StatusBadRequest, "skills is required")
+		return apperror.FieldRequired("skills")
+	}
+	sourcePath := strings.TrimSpace(req.SourcePath)
+	if sourcePath != "" && len(req.Skills) != 1 {
+		return apperror.FieldInvalid("source_path", nil)
 	}
 
-	skillsDir, err := h.ensureSkillsDirHost(botID)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	if err := h.upsertSkills(c.Request().Context(), botID, sourcePath, req.Skills); err != nil {
+		return err
 	}
-	for _, skill := range req.Skills {
-		name := strings.TrimSpace(skill.Name)
-		if !isValidSkillName(name) {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid skill name")
-		}
-		content := strings.TrimSpace(skill.Content)
-		if content == "" {
-			content = buildSkillContent(name, strings.TrimSpace(skill.Description))
-		}
-		dirPath := filepath.Join(skillsDir, name)
-		if err := os.MkdirAll(dirPath, 0o755); err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-		}
-		filePath := filepath.Join(dirPath, "SKILL.md")
-		if err := os.WriteFile(filePath, []byte(content), 0o644); err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-		}
-	}
-
 	return c.JSON(http.StatusOK, skillsOpResponse{OK: true})
 }
 
+func (h *ContainerdHandler) upsertSkills(
+	ctx context.Context,
+	botID, sourcePath string,
+	rawSkills []string,
+) error {
+	client, err := h.getGRPCClient(ctx, botID)
+	if err != nil {
+		return workspaceUnavailableError(err)
+	}
+	if _, _, _, ok := skillset.RegistrySkillIDs(sourcePath); ok {
+		return apperror.New(apperror.CodeSkillRegistryReadOnly, nil)
+	}
+
+	for i, raw := range rawSkills {
+		editPath := ""
+		if i == 0 {
+			editPath = sourcePath
+		}
+		plan, planErr := skillset.PlanUpsert(raw, editPath)
+		if planErr != nil {
+			if errors.Is(planErr, skillset.ErrBuiltinSkillReadOnly) {
+				return apperror.New(apperror.CodeSkillBuiltinReadOnly, nil)
+			}
+			if errors.Is(planErr, skillset.ErrRegistrySkillReadOnly) {
+				return apperror.New(apperror.CodeSkillRegistryReadOnly, nil)
+			}
+			if errors.Is(planErr, skillset.ErrInvalidSkillName) {
+				return apperror.Wrap(apperror.CodeSkillNameInvalid, planErr, nil)
+			}
+			if errors.Is(planErr, skillset.ErrInvalidSkillRequest) {
+				return apperror.FieldInvalid("source_path", planErr)
+			}
+			return errs.Wrap(planErr, "plan skill upsert")
+		}
+		dirPath := path.Dir(plan.WritePath)
+		if plan.RenameFromDir != "" {
+			shared, inspectErr := skillset.HoldsNamespacedSkills(ctx, client, plan.RenameFromDir)
+			if inspectErr != nil {
+				return skillSaveHTTPError(fmt.Errorf("inspect renamed skill directory: %w", inspectErr))
+			}
+			if shared {
+				return apperror.New(apperror.CodeSkillDirectoryShared, nil)
+			}
+			if _, statErr := client.Stat(ctx, dirPath); statErr == nil {
+				return apperror.New(apperror.CodeSkillNameTaken, nil)
+			} else if !errors.Is(statErr, bridge.ErrNotFound) {
+				return skillSaveHTTPError(fmt.Errorf("inspect renamed skill destination: %w", statErr))
+			}
+			if err := client.Rename(ctx, plan.RenameFromDir, dirPath); err != nil {
+				return skillSaveHTTPError(fmt.Errorf("rename skill dir: %w", err))
+			}
+			if err := client.WriteFile(ctx, plan.WritePath, []byte(raw)); err != nil {
+				rollbackErr := client.Rename(context.WithoutCancel(ctx), dirPath, plan.RenameFromDir)
+				if rollbackErr != nil {
+					return apperror.Wrap(
+						apperror.CodeSkillSaveFailed,
+						fmt.Errorf("write renamed skill file: %w; restore original skill directory: %w", err, rollbackErr),
+						nil,
+					)
+				}
+				return skillSaveHTTPError(fmt.Errorf("write renamed skill file: %w", err))
+			}
+			continue
+		}
+		// A new Skill must not land on top of a directory that holds other
+		// Skills; editing an existing Skill in place stays allowed.
+		if editPath == "" || path.Dir(path.Clean(editPath)) != dirPath {
+			shared, inspectErr := skillset.HoldsNamespacedSkills(ctx, client, dirPath)
+			if inspectErr != nil {
+				return skillSaveHTTPError(fmt.Errorf("inspect skill directory: %w", inspectErr))
+			}
+			if shared {
+				return apperror.New(apperror.CodeSkillNameTaken, nil)
+			}
+		}
+		// A pooled client can pass getGRPCClient and still fail on first use
+		// when the workspace just stopped; classify per-op errors so the dial
+		// diagnostics never reach the response body.
+		if err := client.Mkdir(ctx, dirPath); err != nil {
+			return skillSaveHTTPError(fmt.Errorf("mkdir skill dir: %w", err))
+		}
+		if err := client.WriteFile(ctx, plan.WritePath, []byte(raw)); err != nil {
+			return skillSaveHTTPError(fmt.Errorf("write skill file: %w", err))
+		}
+	}
+
+	return nil
+}
+
+// skillActionHTTPError translates a failed Skill action: the Skill package's
+// own refusals, then the workspace failures of its file operations.
+func skillActionHTTPError(err error) error {
+	switch {
+	case errors.Is(err, skillset.ErrSkillNotFound):
+		return apperror.Wrap(apperror.CodeSkillNotFound, err, nil)
+	case errors.Is(err, skillset.ErrSkillNameTaken):
+		return apperror.Wrap(apperror.CodeSkillNameTaken, err, nil)
+	case errors.Is(err, skillset.ErrRegistrySkillReadOnly):
+		return apperror.Wrap(apperror.CodeSkillRegistryReadOnly, err, nil)
+	case errors.Is(err, skillset.ErrBuiltinSkillReadOnly):
+		return apperror.Wrap(apperror.CodeSkillBuiltinReadOnly, err, nil)
+	case errors.Is(err, skillset.ErrInvalidSkillRequest):
+		return apperror.FieldInvalid("target_path", err)
+	default:
+		return fsHTTPError(err)
+	}
+}
+
+func skillSaveHTTPError(err error) error {
+	switch {
+	case errors.Is(err, bridge.ErrNotFound),
+		errors.Is(err, bridge.ErrBadRequest),
+		errors.Is(err, bridge.ErrForbidden):
+		return fsHTTPError(err)
+	case errors.Is(err, bridge.ErrUnavailable):
+		return workspaceUnavailableError(err)
+	default:
+		return apperror.Wrap(apperror.CodeSkillSaveFailed, err, nil)
+	}
+}
+
 // DeleteSkills godoc
-// @Summary Delete skills from data directory
+// @Summary Delete Memoh-managed skills
 // @Tags containerd
 // @Param bot_id path string true "Bot ID"
 // @Param payload body SkillsDeleteRequest true "Delete skills payload"
 // @Success 200 {object} skillsOpResponse
-// @Failure 400 {object} ErrorResponse
-// @Failure 404 {object} ErrorResponse
-// @Failure 500 {object} ErrorResponse
-// @Router /bots/{bot_id}/container/skills [delete]
+// @Failure 400 {object} server.Problem
+// @Failure 409 {object} server.Problem
+// @Failure 404 {object} server.Problem
+// @Failure 500 {object} server.Problem
+// @Failure 503 {object} server.Problem
+// @Router /bots/{bot_id}/container/skills [delete].
 func (h *ContainerdHandler) DeleteSkills(c echo.Context) error {
-	botID, err := h.requireBotAccess(c)
+	botID, err := h.requireBotAccessWithPermission(c, bots.PermissionWorkspaceWrite)
 	if err != nil {
 		return err
 	}
+
 	var req SkillsDeleteRequest
 	if err := c.Bind(&req); err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		return err
 	}
-	if len(req.Names) == 0 {
-		return echo.NewHTTPError(http.StatusBadRequest, "names is required")
-	}
-
-	skillsDir, err := h.ensureSkillsDirHost(botID)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	if len(req.SourcePaths) == 0 {
+		return apperror.FieldRequired("source_paths")
 	}
 
-	for _, name := range req.Names {
-		skillName := strings.TrimSpace(name)
-		if !isValidSkillName(skillName) {
-			return echo.NewHTTPError(http.StatusBadRequest, "invalid skill name")
-		}
-		deletePath := filepath.Join(skillsDir, skillName)
-		if err := os.RemoveAll(deletePath); err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-		}
+	if err := h.deleteSkills(c.Request().Context(), botID, req.SourcePaths); err != nil {
+		return err
 	}
-
 	return c.JSON(http.StatusOK, skillsOpResponse{OK: true})
 }
 
-// LoadSkills loads all skills from the container for the given bot.
-// This implements chat.SkillLoader.
+func (h *ContainerdHandler) deleteSkills(ctx context.Context, botID string, sourcePaths []string) error {
+	ctx, _, err := h.pinCurrentWorkspaceTarget(ctx, botID)
+	if err != nil {
+		return workspaceUnavailableError(err)
+	}
+	client, err := h.getGRPCClient(ctx, botID)
+	if err != nil {
+		return workspaceUnavailableError(err)
+	}
+
+	type deleteTarget struct {
+		sourcePath string
+		skillDir   string
+	}
+	targets := make([]deleteTarget, 0, len(sourcePaths))
+	for _, sourcePath := range sourcePaths {
+		skillDir, dirErr := skillset.DeletableSkillDirForSourcePath(sourcePath)
+		if dirErr != nil {
+			if errors.Is(dirErr, skillset.ErrBuiltinSkillReadOnly) {
+				return apperror.New(apperror.CodeSkillBuiltinReadOnly, nil)
+			}
+			if errors.Is(dirErr, skillset.ErrRegistrySkillReadOnly) {
+				return apperror.New(apperror.CodeSkillRegistryReadOnly, nil)
+			}
+			if errors.Is(dirErr, skillset.ErrInvalidSkillRequest) {
+				return apperror.FieldInvalid("source_paths", dirErr)
+			}
+			return errs.Wrap(dirErr, "resolve skill directory")
+		}
+		target := deleteTarget{sourcePath: path.Clean(strings.TrimSpace(sourcePath)), skillDir: skillDir}
+		// The Skill itself must exist, and its directory must not also hold
+		// other Skills, which a recursive delete would remove with it.
+		if _, statErr := client.Stat(ctx, target.sourcePath); statErr != nil {
+			return fsHTTPError(statErr)
+		}
+		shared, inspectErr := skillset.HoldsNamespacedSkills(ctx, client, target.skillDir)
+		if inspectErr != nil {
+			return fsHTTPError(inspectErr)
+		}
+		if shared {
+			return apperror.New(apperror.CodeSkillDirectoryShared, nil)
+		}
+		targets = append(targets, target)
+	}
+
+	for _, target := range targets {
+		if err := client.DeleteFile(ctx, target.skillDir, true); err != nil {
+			return fsHTTPError(err)
+		}
+		pruneEmptySkillNamespaceDirs(ctx, client, target.skillDir)
+	}
+
+	return nil
+}
+
+type currentWorkspaceTargetResolver interface {
+	CurrentWorkspaceTargetID(ctx context.Context, botID string) (string, error)
+}
+
+func (h *ContainerdHandler) currentWorkspaceTargetID(ctx context.Context, botID string) (string, error) {
+	if targetID := bridge.WorkspaceTargetFromContext(ctx); targetID != "" {
+		return targetID, nil
+	}
+	resolver, ok := h.manager.(currentWorkspaceTargetResolver)
+	if !ok {
+		return workspace.WorkspaceTargetNative, nil
+	}
+	return resolver.CurrentWorkspaceTargetID(ctx, botID)
+}
+
+func (h *ContainerdHandler) pinCurrentWorkspaceTarget(
+	ctx context.Context,
+	botID string,
+) (context.Context, string, error) {
+	targetID, err := h.currentWorkspaceTargetID(ctx, botID)
+	if err != nil {
+		return ctx, "", err
+	}
+	return bridge.WithWorkspaceTarget(ctx, targetID), targetID, nil
+}
+
+// pruneEmptySkillNamespaceDirs drops the app and namespace directories left
+// behind by the last deleted Skill. Best effort: a concurrent install may refill
+// them, and a stale empty directory is harmless to discovery.
+func pruneEmptySkillNamespaceDirs(ctx context.Context, client *bridge.Client, skillDir string) {
+	for _, dir := range skillset.PrunableSkillNamespaceDirs(skillDir) {
+		entries, err := client.ListDirAll(ctx, dir, false)
+		if err != nil || len(entries) > 0 {
+			return
+		}
+		if err := client.DeleteFile(ctx, dir, false); err != nil {
+			return
+		}
+	}
+}
+
+// ApplySkillAction godoc
+// @Summary Apply an action to a discovered or managed skill source
+// @Tags containerd
+// @Param bot_id path string true "Bot ID"
+// @Param payload body SkillsActionRequest true "Skill action payload"
+// @Success 200 {object} skillsOpResponse
+// @Failure 400 {object} server.Problem
+// @Failure 404 {object} server.Problem
+// @Failure 409 {object} server.Problem
+// @Failure 500 {object} server.Problem
+// @Failure 503 {object} server.Problem
+// @Router /bots/{bot_id}/container/skills/actions [post].
+func (h *ContainerdHandler) ApplySkillAction(c echo.Context) error {
+	botID, err := h.requireBotAccessWithPermission(c, bots.PermissionWorkspaceWrite)
+	if err != nil {
+		return err
+	}
+
+	var req SkillsActionRequest
+	if err := c.Bind(&req); err != nil {
+		return err
+	}
+
+	if strings.TrimSpace(req.TargetPath) == "" {
+		return apperror.FieldRequired("target_path")
+	}
+	switch strings.TrimSpace(req.Action) {
+	case skillset.ActionAdopt, skillset.ActionDisable, skillset.ActionEnable:
+	case "":
+		return apperror.FieldRequired("action")
+	default:
+		return apperror.FieldInvalid("action", nil)
+	}
+
+	if err := h.applySkillAction(c.Request().Context(), botID, req); err != nil {
+		return err
+	}
+	return c.JSON(http.StatusOK, skillsOpResponse{OK: true})
+}
+
+func (h *ContainerdHandler) applySkillAction(ctx context.Context, botID string, req SkillsActionRequest) error {
+	if _, _, _, ok := skillset.RegistrySkillIDs(req.TargetPath); ok {
+		return apperror.New(apperror.CodeSkillRegistryReadOnly, nil)
+	}
+	ctx, _, err := h.pinCurrentWorkspaceTarget(ctx, botID)
+	if err != nil {
+		return workspaceUnavailableError(err)
+	}
+	client, err := h.getGRPCClient(ctx, botID)
+	if err != nil {
+		return workspaceUnavailableError(err)
+	}
+	roots, err := h.skillDiscoveryRoots(ctx, botID)
+	if err != nil {
+		return errs.Wrap(err, "discover skill roots")
+	}
+
+	if err := skillset.ApplyAction(ctx, client, roots, skillset.ActionRequest{
+		Action:     req.Action,
+		TargetPath: req.TargetPath,
+	}); err != nil {
+		return skillActionHTTPError(err)
+	}
+
+	return nil
+}
+
+// LoadSkills loads the effective skills from the container for the given bot.
 func (h *ContainerdHandler) LoadSkills(ctx context.Context, botID string) ([]SkillItem, error) {
-	skillsDir, err := h.ensureSkillsDirHost(botID)
+	ctx, _, err := h.pinCurrentWorkspaceTarget(ctx, botID)
 	if err != nil {
 		return nil, err
 	}
-
-	entries, err := listSkillEntries(skillsDir)
+	client, err := h.getGRPCClient(ctx, botID)
 	if err != nil {
 		return nil, err
 	}
-
-	skills := make([]SkillItem, 0, len(entries))
-	for _, entry := range entries {
-		skillPath, name := skillPathForEntry(entry)
-		if skillPath == "" {
-			continue
-		}
-		raw, err := h.readSkillFile(skillsDir, skillPath)
-		if err != nil {
-			continue
-		}
-		parsed := parseSkillFile(raw, name)
-		skills = append(skills, SkillItem{
-			Name:        parsed.Name,
-			Description: parsed.Description,
-			Content:     parsed.Content,
-			Metadata:    parsed.Metadata,
-		})
-	}
-	return skills, nil
-}
-
-func (h *ContainerdHandler) ensureSkillsDirHost(botID string) (string, error) {
-	root, err := h.ensureBotDataRoot(botID)
-	if err != nil {
-		return "", err
-	}
-	skillsDir := filepath.Join(root, ".skills")
-	if err := os.MkdirAll(skillsDir, 0o755); err != nil {
-		return "", err
-	}
-	return skillsDir, nil
-}
-
-func (h *ContainerdHandler) readSkillFile(skillsDir, filePath string) (string, error) {
-	safeRel := strings.TrimPrefix(strings.TrimPrefix(filePath, ".skills/"), "./.skills/")
-	if safeRel == "" {
-		return "", os.ErrInvalid
-	}
-	target := filepath.Join(skillsDir, filepath.FromSlash(safeRel))
-	data, err := os.ReadFile(target)
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
-}
-
-func listSkillEntries(skillsDir string) ([]skillEntry, error) {
-	dirEntries, err := os.ReadDir(skillsDir)
+	roots, err := h.skillDiscoveryRoots(ctx, botID)
 	if err != nil {
 		return nil, err
 	}
-	entries := make([]skillEntry, 0, len(dirEntries))
-	for _, entry := range dirEntries {
-		name := entry.Name()
-		if name == "" {
-			continue
+	items, err := skillset.LoadEffective(ctx, client, roots)
+	if err != nil {
+		return nil, err
+	}
+	return skillItemsFromEntries(items), nil
+}
+
+func (h *ContainerdHandler) ListSafeSkillCatalog(ctx context.Context, botID string) ([]skillset.SafeCatalogItem, error) {
+	return h.buildSafeSkillCatalog(ctx, botID)
+}
+
+func (h *ContainerdHandler) buildSafeSkillCatalog(ctx context.Context, botID string) ([]skillset.SafeCatalogItem, error) {
+	entries, err := h.listSkillEntriesFromContainer(ctx, botID)
+	if err != nil {
+		return nil, err
+	}
+	return skillset.BuildSafeCatalog(entries)
+}
+
+func (h *ContainerdHandler) ResolveTextRequestedSkills(ctx context.Context, botID string, names []string) ([]skillset.ResolvedSkill, error) {
+	entries, err := h.listSkillEntriesFromContainer(ctx, botID)
+	if err != nil {
+		return nil, err
+	}
+	return skillset.ResolveTextRequestedSkills(entries, names, skillset.ResolveLimits{})
+}
+
+func (h *ContainerdHandler) listSkillsFromContainer(ctx context.Context, botID string) ([]SkillItem, error) {
+	items, err := h.listSkillEntriesFromContainer(ctx, botID)
+	if err != nil {
+		return nil, err
+	}
+	return skillItemsFromEntries(items), nil
+}
+
+func (h *ContainerdHandler) listSkillEntriesFromContainer(ctx context.Context, botID string) ([]skillset.Entry, error) {
+	ctx, _, err := h.pinCurrentWorkspaceTarget(ctx, botID)
+	if err != nil {
+		return nil, err
+	}
+	client, err := h.getGRPCClient(ctx, botID)
+	if err != nil {
+		return nil, err
+	}
+	roots, err := h.skillDiscoveryRoots(ctx, botID)
+	if err != nil {
+		return nil, err
+	}
+	items, err := skillset.List(ctx, client, roots)
+	if err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+func (h *ContainerdHandler) skillDiscoveryRoots(
+	ctx context.Context,
+	botID string,
+) ([]string, error) {
+	var roots []string
+	if h.botService != nil {
+		bot, err := h.botService.Get(ctx, botID)
+		if err == nil {
+			return workspace.SkillDiscoveryRootsFromMetadata(bot.Metadata), nil
 		}
-		if entry.IsDir() {
-			entries = append(entries, skillEntry{
-				Path:  path.Join(".skills", name),
-				IsDir: true,
-			})
-			continue
+	}
+	if h.manager == nil {
+		return nil, nil
+	}
+	var err error
+	roots, err = h.manager.ResolveWorkspaceSkillDiscoveryRoots(ctx, botID)
+	if err != nil {
+		return nil, err
+	}
+	return roots, nil
+}
+
+func skillItemsFromEntries(entries []skillset.Entry) []SkillItem {
+	items := make([]SkillItem, len(entries))
+	for i, entry := range entries {
+		_, builtin := skillset.BuiltinSkillName(entry.SourcePath)
+		registryID, appID, skillID, appMember := skillset.RegistrySkillIDs(entry.SourcePath)
+		registryOwned := entry.SourceKind == skillset.SourceKindRegistry || appMember
+		items[i] = SkillItem{
+			Name:        entry.Name,
+			Description: entry.Description,
+			Content:     entry.Content,
+			Metadata:    entry.Metadata,
+			Raw:         entry.Raw,
+			SourcePath:  entry.SourcePath,
+			SourceRoot:  entry.SourceRoot,
+			SourceKind:  entry.SourceKind,
+			Managed:     entry.Managed,
+			Editable:    !builtin && !registryOwned,
+			Deletable:   entry.Managed && !builtin && !appMember,
+			State:       entry.State,
+			ShadowedBy:  entry.ShadowedBy,
+			RegistryID:  registryID,
+			AppID:       appID,
+			SkillID:     skillID,
 		}
-		if name == "SKILL.md" {
-			entries = append(entries, skillEntry{
-				Path:  path.Join(".skills", name),
-				IsDir: false,
-			})
-		}
 	}
-	return entries, nil
-}
-
-type skillEntry struct {
-	Path  string
-	IsDir bool
-}
-
-func skillNameFromPath(rel string) string {
-	if rel == "" || rel == "SKILL.md" {
-		return "default"
-	}
-	parent := path.Dir(rel)
-	if parent == "." {
-		return "default"
-	}
-	return path.Base(parent)
-}
-
-func skillPathForEntry(entry skillEntry) (string, string) {
-	rel := strings.TrimPrefix(entry.Path, ".skills/")
-	if rel == entry.Path {
-		rel = strings.TrimPrefix(entry.Path, "./.skills/")
-	}
-	if entry.IsDir {
-		name := path.Base(rel)
-		if name == "." || name == "" {
-			return "", ""
-		}
-		return path.Join(".skills", name, "SKILL.md"), name
-	}
-	if path.Base(rel) == "SKILL.md" {
-		return path.Join(".skills", "SKILL.md"), skillNameFromPath(rel)
-	}
-	return "", ""
-}
-
-// parsedSkill holds the result of parsing a SKILL.md file with YAML frontmatter.
-type parsedSkill struct {
-	Name        string
-	Description string
-	Content     string         // body after frontmatter
-	Metadata    map[string]any // "metadata" key from frontmatter
-}
-
-// parseSkillFile parses a SKILL.md file with YAML frontmatter delimited by "---".
-// Format:
-//
-//	---
-//	name: your-skill-name
-//	description: Brief description
-//	metadata:
-//	  key: value
-//	---
-//	# Body content ...
-func parseSkillFile(raw string, fallbackName string) parsedSkill {
-	trimmed := strings.TrimSpace(raw)
-	result := parsedSkill{
-		Name:    strings.TrimSpace(fallbackName),
-		Content: trimmed,
-	}
-	if !strings.HasPrefix(trimmed, "---") {
-		return normalizeParsedSkill(result)
-	}
-
-	// Find closing "---".
-	rest := trimmed[3:]
-	rest = strings.TrimLeft(rest, " \t")
-	if len(rest) > 0 && rest[0] == '\n' {
-		rest = rest[1:]
-	} else if len(rest) > 1 && rest[0] == '\r' && rest[1] == '\n' {
-		rest = rest[2:]
-	}
-	closingIdx := strings.Index(rest, "\n---")
-	if closingIdx < 0 {
-		return normalizeParsedSkill(result)
-	}
-
-	frontmatterRaw := rest[:closingIdx]
-	body := rest[closingIdx+4:]
-	body = strings.TrimLeft(body, "\r\n")
-	result.Content = body
-
-	var fm struct {
-		Name        string         `yaml:"name"`
-		Description string         `yaml:"description"`
-		Metadata    map[string]any `yaml:"metadata"`
-	}
-	if err := yaml.Unmarshal([]byte(frontmatterRaw), &fm); err != nil {
-		return normalizeParsedSkill(result)
-	}
-
-	if strings.TrimSpace(fm.Name) != "" {
-		result.Name = strings.TrimSpace(fm.Name)
-	}
-	result.Description = strings.TrimSpace(fm.Description)
-	result.Metadata = fm.Metadata
-
-	return normalizeParsedSkill(result)
-}
-
-func normalizeParsedSkill(skill parsedSkill) parsedSkill {
-	if strings.TrimSpace(skill.Name) == "" {
-		skill.Name = "default"
-	}
-	skill.Name = strings.TrimSpace(skill.Name)
-	skill.Description = strings.TrimSpace(skill.Description)
-	skill.Content = strings.TrimSpace(skill.Content)
-
-	if skill.Description == "" {
-		skill.Description = skill.Name
-	}
-	if skill.Content == "" {
-		skill.Content = skill.Description
-	}
-
-	return skill
-}
-
-func buildSkillContent(name, description string) string {
-	if description == "" {
-		description = name
-	}
-	return "---\nname: " + name + "\ndescription: " + description + "\n---\n\n# " + name + "\n\n" + description
-}
-
-func isValidSkillName(name string) bool {
-	if name == "" {
-		return false
-	}
-	if strings.Contains(name, "..") {
-		return false
-	}
-	if strings.Contains(name, "/") || strings.Contains(name, "\\") {
-		return false
-	}
-	return true
+	return items
 }

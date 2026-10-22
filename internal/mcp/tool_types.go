@@ -3,20 +3,17 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
+
+	"github.com/felinics/memoh/internal/toolcontext"
 )
 
-// ToolSessionContext carries request-scoped identity for tool execution.
-type ToolSessionContext struct {
-	BotID             string
-	ChatID            string
-	ChannelIdentityID string
-	SessionToken      string
-	CurrentPlatform   string
-	ReplyTarget       string
-}
+// ToolSessionContext is the MCP gateway's compatibility name for the shared
+// tool execution context. The canonical type is owned by internal/toolcontext.
+type ToolSessionContext = toolcontext.Session
 
 // ToolDescriptor is the MCP tools/list item shape used by the gateway.
 type ToolDescriptor struct {
@@ -25,17 +22,20 @@ type ToolDescriptor struct {
 	InputSchema map[string]any `json:"inputSchema"`
 }
 
-// ToolExecutor represents business-facing tools (message/schedule/memory).
-type ToolExecutor interface {
+// ToolSource represents a tool source surfaced through the MCP gateway.
+// Implementations may wrap federated MCP connections or selected native Memoh
+// ToolProviders.
+type ToolSource interface {
 	ListTools(ctx context.Context, session ToolSessionContext) ([]ToolDescriptor, error)
 	CallTool(ctx context.Context, session ToolSessionContext, toolName string, arguments map[string]any) (map[string]any, error)
 }
 
-// ToolSource represents infrastructure-level tool sources (federation/connectors).
-// A source is not a business tool itself; it supplies and routes downstream tools.
-type ToolSource interface {
-	ListTools(ctx context.Context, session ToolSessionContext) ([]ToolDescriptor, error)
-	CallTool(ctx context.Context, session ToolSessionContext, toolName string, arguments map[string]any) (map[string]any, error)
+// ToolSourceDiagnostics is implemented by sources that can explain, in text
+// meant for the model, why some or all of their tools are missing from
+// ListTools. The agent surfaces the lines in the system prompt so a degraded
+// source is reported instead of silently looking empty.
+type ToolSourceDiagnostics interface {
+	ToolDiagnostics(ctx context.Context, session ToolSessionContext) []string
 }
 
 // ToolCallPayload is the MCP tools/call params payload.
@@ -45,7 +45,7 @@ type ToolCallPayload struct {
 }
 
 // ErrToolNotFound indicates the provider does not own the requested tool.
-var ErrToolNotFound = fmt.Errorf("tool not found")
+var ErrToolNotFound = errors.New("tool not found")
 
 // BuildToolSuccessResult builds a standard MCP tool success result object.
 func BuildToolSuccessResult(structured any) map[string]any {
@@ -148,37 +148,66 @@ func IntArg(arguments map[string]any, key string) (int, bool, error) {
 	case int32:
 		return int(value), true, nil
 	case int64:
-		return int(value), true, nil
+		i, err := int64ToInt(value, key)
+		return i, true, err
 	case uint:
-		return int(value), true, nil
+		i, err := uint64ToInt(uint64(value), key)
+		return i, true, err
 	case uint8:
 		return int(value), true, nil
 	case uint16:
 		return int(value), true, nil
 	case uint32:
-		return int(value), true, nil
+		i, err := uint64ToInt(uint64(value), key)
+		return i, true, err
 	case uint64:
-		return int(value), true, nil
+		i, err := uint64ToInt(value, key)
+		return i, true, err
 	case float32:
 		f := float64(value)
 		if math.IsNaN(f) || math.IsInf(f, 0) {
 			return 0, true, fmt.Errorf("%s must be a valid number", key)
 		}
-		return int(f), true, nil
+		i, err := float64ToInt(f, key)
+		return i, true, err
 	case float64:
 		if math.IsNaN(value) || math.IsInf(value, 0) {
 			return 0, true, fmt.Errorf("%s must be a valid number", key)
 		}
-		return int(value), true, nil
+		i, err := float64ToInt(value, key)
+		return i, true, err
 	case json.Number:
 		i, err := value.Int64()
 		if err != nil {
 			return 0, true, fmt.Errorf("%s must be an integer", key)
 		}
-		return int(i), true, nil
+		n, convErr := int64ToInt(i, key)
+		return n, true, convErr
 	default:
 		return 0, true, fmt.Errorf("%s must be a number", key)
 	}
+}
+
+func int64ToInt(value int64, key string) (int, error) {
+	if value < int64(math.MinInt) || value > int64(math.MaxInt) {
+		return 0, fmt.Errorf("%s out of range", key)
+	}
+	return int(value), nil
+}
+
+func uint64ToInt(value uint64, key string) (int, error) {
+	const maxIntAsUint = uint64(math.MaxInt)
+	if value > maxIntAsUint {
+		return 0, fmt.Errorf("%s out of range", key)
+	}
+	return int(value), nil
+}
+
+func float64ToInt(value float64, key string) (int, error) {
+	if value < float64(math.MinInt) || value > float64(math.MaxInt) {
+		return 0, fmt.Errorf("%s out of range", key)
+	}
+	return int(value), nil
 }
 
 func BoolArg(arguments map[string]any, key string) (bool, bool, error) {

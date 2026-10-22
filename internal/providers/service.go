@@ -3,86 +3,174 @@ package providers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"strings"
+	"time"
 
-	"github.com/memohai/memoh/internal/db"
-	"github.com/memohai/memoh/internal/db/sqlc"
+	sdk "github.com/felinics/twilight/sdk"
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/felinics/memoh/internal/db"
+	"github.com/felinics/memoh/internal/db/postgres/sqlc"
+	dbstore "github.com/felinics/memoh/internal/db/store"
+	"github.com/felinics/memoh/internal/errs"
+	"github.com/felinics/memoh/internal/models"
+	"github.com/felinics/memoh/internal/providertemplates"
+	"github.com/felinics/memoh/internal/registry"
 )
 
-// Service handles provider operations
+// Service handles provider operations.
 type Service struct {
-	queries *sqlc.Queries
-	logger  *slog.Logger
+	queries      dbstore.Queries
+	logger       *slog.Logger
+	httpClient   *http.Client
+	callbackURL  string
+	templatesDir string
 }
 
-// NewService creates a new provider service
-func NewService(log *slog.Logger, queries *sqlc.Queries) *Service {
+// NewService creates a new provider service.
+func NewService(log *slog.Logger, queries dbstore.Queries, callbackURL string, templatesDir ...string) *Service {
+	if log == nil {
+		log = slog.Default()
+	}
+	var dir string
+	if len(templatesDir) > 0 {
+		dir = templatesDir[0]
+	}
 	return &Service{
-		queries: queries,
-		logger:  log.With(slog.String("service", "providers")),
+		queries:      queries,
+		logger:       log.With(slog.String("service", "providers")),
+		httpClient:   &http.Client{Timeout: providerOAuthHTTPTimeout},
+		callbackURL:  callbackURL,
+		templatesDir: dir,
 	}
 }
 
-// Create creates a new LLM provider
+// Create creates a new provider.
 func (s *Service) Create(ctx context.Context, req CreateRequest) (GetResponse, error) {
-	// Validate client type
-	if !isValidClientType(req.ClientType) {
-		return GetResponse{}, fmt.Errorf("invalid client_type: %s", req.ClientType)
-	}
-
-	// Marshal metadata
 	metadataJSON, err := json.Marshal(req.Metadata)
 	if err != nil {
 		return GetResponse{}, fmt.Errorf("marshal metadata: %w", err)
 	}
 
-	// Create provider
-	provider, err := s.queries.CreateLlmProvider(ctx, sqlc.CreateLlmProviderParams{
+	clientType := req.ClientType
+	if clientType == "" {
+		clientType = string(models.ClientTypeOpenAICompletions)
+	}
+	configJSON, err := json.Marshal(normalizeProviderConfig(clientType, req.Config))
+	if err != nil {
+		return GetResponse{}, fmt.Errorf("marshal config: %w", err)
+	}
+
+	var icon pgtype.Text
+	if req.Icon != "" {
+		icon = pgtype.Text{String: req.Icon, Valid: true}
+	}
+
+	provider, err := s.queries.CreateProvider(ctx, sqlc.CreateProviderParams{
 		Name:       req.Name,
-		ClientType: string(req.ClientType),
-		BaseUrl:    req.BaseURL,
-		ApiKey:     req.APIKey,
+		ClientType: clientType,
+		Icon:       icon,
+		Enable:     true,
+		Config:     configJSON,
 		Metadata:   metadataJSON,
 	})
 	if err != nil {
-		return GetResponse{}, fmt.Errorf("create provider: %w", err)
+		if db.IsUniqueViolation(err) {
+			if provider, ok, activateErr := s.activateHiddenRegistryTemplate(ctx, req, clientType, icon, configJSON, metadataJSON); ok {
+				if activateErr != nil {
+					return GetResponse{}, activateErr
+				}
+				return s.toGetResponse(provider), nil
+			}
+			return GetResponse{}, fmt.Errorf("create provider: %w: %w", ErrNameTaken, err)
+		}
+		return GetResponse{}, errs.Wrap(err, "create provider")
 	}
 
 	return s.toGetResponse(provider), nil
 }
 
-// Get retrieves a provider by ID
+func (s *Service) CreateFromTemplate(ctx context.Context, req CreateFromTemplateRequest) (GetResponse, error) {
+	expectedDomain := providertemplates.Domain(strings.TrimSpace(req.Domain))
+	if expectedDomain != "" && !providertemplates.IsValidDomain(expectedDomain) {
+		return GetResponse{}, fmt.Errorf("%w: %s", providertemplates.ErrDomainInvalid, expectedDomain)
+	}
+	template, err := providertemplates.Resolve(ctx, s.queries, req.TemplateID, expectedDomain)
+	if err != nil {
+		return GetResponse{}, err
+	}
+	switch providertemplates.Domain(template.Domain) {
+	case providertemplates.DomainLLM, providertemplates.DomainSpeech, providertemplates.DomainTranscription, providertemplates.DomainVideo:
+	default:
+		return GetResponse{}, fmt.Errorf("%w: %s", providertemplates.ErrDomainMismatch, template.Domain)
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		name = template.Name
+	}
+	config := providertemplates.MergeConfig(providertemplates.DecodeConfig(template.DefaultConfig), req.Config)
+	configJSON, err := providertemplates.Marshal(normalizeProviderConfig(template.Driver, config))
+	if err != nil {
+		return GetResponse{}, err
+	}
+	metadataJSON, err := providertemplates.Marshal(providertemplates.MergeMetadata(template, req.Metadata))
+	if err != nil {
+		return GetResponse{}, err
+	}
+	provider, err := s.queries.CreateProviderFromTemplate(ctx, sqlc.CreateProviderFromTemplateParams{
+		ProviderTemplateID: template.ID,
+		Name:               name,
+		ClientType:         template.Driver,
+		Icon:               template.Icon,
+		Enable:             true,
+		Config:             configJSON,
+		Metadata:           metadataJSON,
+	})
+	if err != nil {
+		if db.IsUniqueViolation(err) {
+			return GetResponse{}, fmt.Errorf("create provider from template: %w: %w", ErrNameTaken, err)
+		}
+		return GetResponse{}, errs.Wrap(err, "create provider from template")
+	}
+	return s.toGetResponse(provider), nil
+}
+
+// Get retrieves a provider by ID.
 func (s *Service) Get(ctx context.Context, id string) (GetResponse, error) {
 	providerID, err := db.ParseUUID(id)
 	if err != nil {
 		return GetResponse{}, err
 	}
 
-	provider, err := s.queries.GetLlmProviderByID(ctx, providerID)
+	provider, err := s.queries.GetProviderByID(ctx, providerID)
 	if err != nil {
-		return GetResponse{}, fmt.Errorf("get provider: %w", err)
+		return GetResponse{}, errs.Wrap(err, "get provider")
 	}
 
 	return s.toGetResponse(provider), nil
 }
 
-// GetByName retrieves a provider by name
+// GetByName retrieves a provider by name.
 func (s *Service) GetByName(ctx context.Context, name string) (GetResponse, error) {
-	provider, err := s.queries.GetLlmProviderByName(ctx, name)
+	provider, err := s.queries.GetProviderByName(ctx, name)
 	if err != nil {
-		return GetResponse{}, fmt.Errorf("get provider by name: %w", err)
+		return GetResponse{}, errs.Wrap(err, "get provider by name")
 	}
 
 	return s.toGetResponse(provider), nil
 }
 
-// List retrieves all providers
+// List retrieves all providers.
 func (s *Service) List(ctx context.Context) ([]GetResponse, error) {
-	providers, err := s.queries.ListLlmProviders(ctx)
+	providers, err := s.queries.ListProviders(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("list providers: %w", err)
+		return nil, errs.Wrap(err, "list providers")
 	}
 
 	results := make([]GetResponse, 0, len(providers))
@@ -92,38 +180,18 @@ func (s *Service) List(ctx context.Context) ([]GetResponse, error) {
 	return results, nil
 }
 
-// ListByClientType retrieves providers by client type
-func (s *Service) ListByClientType(ctx context.Context, clientType ClientType) ([]GetResponse, error) {
-	if !isValidClientType(clientType) {
-		return nil, fmt.Errorf("invalid client_type: %s", clientType)
-	}
-
-	providers, err := s.queries.ListLlmProvidersByClientType(ctx, string(clientType))
-	if err != nil {
-		return nil, fmt.Errorf("list providers by client type: %w", err)
-	}
-
-	results := make([]GetResponse, 0, len(providers))
-	for _, p := range providers {
-		results = append(results, s.toGetResponse(p))
-	}
-	return results, nil
-}
-
-// Update updates an existing provider
+// Update updates an existing provider.
 func (s *Service) Update(ctx context.Context, id string, req UpdateRequest) (GetResponse, error) {
 	providerID, err := db.ParseUUID(id)
 	if err != nil {
 		return GetResponse{}, err
 	}
 
-	// Get existing provider
-	existing, err := s.queries.GetLlmProviderByID(ctx, providerID)
+	existing, err := s.queries.GetProviderByID(ctx, providerID)
 	if err != nil {
-		return GetResponse{}, fmt.Errorf("get provider: %w", err)
+		return GetResponse{}, errs.Wrap(err, "get provider")
 	}
 
-	// Apply updates
 	name := existing.Name
 	if req.Name != nil {
 		name = *req.Name
@@ -131,117 +199,651 @@ func (s *Service) Update(ctx context.Context, id string, req UpdateRequest) (Get
 
 	clientType := existing.ClientType
 	if req.ClientType != nil {
-		if !isValidClientType(*req.ClientType) {
-			return GetResponse{}, fmt.Errorf("invalid client_type: %s", *req.ClientType)
+		clientType = *req.ClientType
+	}
+
+	icon := existing.Icon
+	if req.Icon != nil {
+		icon = pgtype.Text{String: *req.Icon, Valid: *req.Icon != ""}
+	}
+
+	enable := existing.Enable
+	if req.Enable != nil {
+		enable = *req.Enable
+	}
+
+	existingConfig := providerConfig(existing.Config)
+	if req.Config != nil {
+		mergedConfig := mergeProviderConfig(existingConfig, req.Config)
+		for _, key := range SecretConfigKeys {
+			preserveMaskedConfigSecret(mergedConfig, existingConfig, req.Config, key)
 		}
-		clientType = string(*req.ClientType)
+		existingConfig = normalizeProviderConfig(clientType, mergedConfig)
+	} else {
+		existingConfig = normalizeProviderConfig(clientType, existingConfig)
+	}
+	configJSON, err := json.Marshal(existingConfig)
+	if err != nil {
+		return GetResponse{}, fmt.Errorf("marshal config: %w", err)
 	}
 
-	baseURL := existing.BaseUrl
-	if req.BaseURL != nil {
-		baseURL = *req.BaseURL
-	}
-
-	apiKey := resolveUpdatedAPIKey(existing.ApiKey, req.APIKey)
-
-	metadata := existing.Metadata
+	metadataMap := providerMetadata(existing.Metadata)
 	if req.Metadata != nil {
-		metadataJSON, err := json.Marshal(req.Metadata)
-		if err != nil {
-			return GetResponse{}, fmt.Errorf("marshal metadata: %w", err)
-		}
-		metadata = metadataJSON
+		metadataMap = req.Metadata
+	}
+	metadataJSON, err := json.Marshal(metadataMap)
+	if err != nil {
+		return GetResponse{}, fmt.Errorf("marshal metadata: %w", err)
 	}
 
-	// Update provider
-	updated, err := s.queries.UpdateLlmProvider(ctx, sqlc.UpdateLlmProviderParams{
+	updated, err := s.queries.UpdateProvider(ctx, sqlc.UpdateProviderParams{
 		ID:         providerID,
 		Name:       name,
 		ClientType: clientType,
-		BaseUrl:    baseURL,
-		ApiKey:     apiKey,
-		Metadata:   metadata,
+		Icon:       icon,
+		Enable:     enable,
+		Config:     configJSON,
+		Metadata:   metadataJSON,
 	})
 	if err != nil {
-		return GetResponse{}, fmt.Errorf("update provider: %w", err)
+		if db.IsUniqueViolation(err) {
+			return GetResponse{}, fmt.Errorf("update provider: %w: %w", ErrNameTaken, err)
+		}
+		return GetResponse{}, errs.Wrap(err, "update provider")
 	}
 
 	return s.toGetResponse(updated), nil
 }
 
-// Delete deletes a provider by ID
+// Delete deletes a provider by ID.
 func (s *Service) Delete(ctx context.Context, id string) error {
 	providerID, err := db.ParseUUID(id)
 	if err != nil {
 		return err
 	}
 
-	if err := s.queries.DeleteLlmProvider(ctx, providerID); err != nil {
-		return fmt.Errorf("delete provider: %w", err)
+	if err := s.queries.DeleteProvider(ctx, providerID); err != nil {
+		return errs.Wrap(err, "delete provider")
 	}
 	return nil
 }
 
-// Count returns the total count of providers
+// Count returns the total count of providers.
 func (s *Service) Count(ctx context.Context) (int64, error) {
-	count, err := s.queries.CountLlmProviders(ctx)
+	providers, err := s.List(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("count providers: %w", err)
 	}
-	return count, nil
+	return int64(len(providers)), nil
 }
 
-// CountByClientType returns the count of providers by client type
-func (s *Service) CountByClientType(ctx context.Context, clientType ClientType) (int64, error) {
-	if !isValidClientType(clientType) {
-		return 0, fmt.Errorf("invalid client_type: %s", clientType)
-	}
+const probeTimeout = models.DefaultProviderProbeTimeout
 
-	count, err := s.queries.CountLlmProvidersByClientType(ctx, string(clientType))
+// remoteModelsResponseLimit bounds the /models body read for extension fields.
+const remoteModelsResponseLimit = 8 << 20
+
+const (
+	registryMetadataKey = "registry"
+	metadataSourceKey   = "source"
+)
+
+// Test probes the provider using the Twilight AI SDK to check
+// reachability and authentication. A successful models-list response is
+// conclusive; no follow-up generation probe is made. An earlier fake-model
+// probe was removed (#1042): some OpenAI-compatible gateways validate the
+// model before auth and answer 401 for an unknown model, which the probe
+// misclassified as "Invalid API key" even after the key had authenticated.
+// Per-model availability is covered by models.Service.Test instead.
+//
+// Outcome semantics (#1087): the models list is only a partial falsifier,
+// so the outcome follows what sdk.Provider.Test returned:
+//   - nil: verified (ok), except for OpenCode Go, whose models list is
+//     public and answers without valid credentials (unverified);
+//   - an *sdk.APIError of kind authentication or permission_denied: auth
+//     failed (auth_error). The request carries no model parameter, so this
+//     cannot be confused with "model not found";
+//   - any other *sdk.APIError (404, 429, 5xx, ...): unverified, NOT a
+//     failure. The endpoint answered, but the base URL may be wrong or the
+//     provider may not implement model listing;
+//   - no *sdk.APIError in the chain (DNS, TCP, TLS, an ended context): error,
+//     the only hard failure kept at this layer.
+//
+// Every outcome other than ok carries the SDK error as Cause.
+func (s *Service) Test(ctx context.Context, id string) (TestResponse, error) {
+	providerID, err := db.ParseUUID(id)
 	if err != nil {
-		return 0, fmt.Errorf("count providers by client type: %w", err)
+		return TestResponse{}, err
 	}
-	return count, nil
+
+	provider, err := s.queries.GetProviderByID(ctx, providerID)
+	if err != nil {
+		return TestResponse{}, errs.Wrap(err, "get provider")
+	}
+
+	cfg := providerConfig(provider.Config)
+	baseURL := strings.TrimRight(configString(cfg, "base_url"), "/")
+
+	clientType := models.ClientType(provider.ClientType)
+	creds, err := s.ResolveModelCredentials(ctx, provider)
+	if err != nil {
+		return TestResponse{}, err
+	}
+
+	sdkProvider := models.NewSDKProvider(baseURL, creds.APIKey, creds.CodexAccountID, clientType, probeTimeout, nil)
+
+	start := time.Now()
+	resp := providerTestOutcome(sdkProvider.Test(ctx))
+	if clientType == models.ClientTypeOpenCodeGo && resp.Status == TestStatusOK {
+		// Go's public catalog succeeds without valid credentials. Keep the UI
+		// verdict unverified until the user runs a real model generation probe.
+		resp.Status = TestStatusUnverified
+	}
+	resp.LatencyMs = time.Since(start).Milliseconds()
+	return resp, nil
 }
 
-// toGetResponse converts a database provider to a response
-func (s *Service) toGetResponse(provider sqlc.LlmProvider) GetResponse {
-	var metadata map[string]any
-	if len(provider.Metadata) > 0 {
-		if err := json.Unmarshal(provider.Metadata, &metadata); err != nil {
-			slog.Warn("provider metadata unmarshal failed", slog.String("id", provider.ID.String()), slog.Any("error", err))
+// providerTestOutcome maps the result of sdk.Provider.Test to a TestResponse
+// by the rules documented on Service.Test.
+func providerTestOutcome(err error) TestResponse {
+	if err == nil {
+		return TestResponse{Status: TestStatusOK, Reachable: true}
+	}
+	cause := errs.WrapDependency(err, "test provider")
+	if kind := sdk.KindOf(err); kind == sdk.KindAuthentication || kind == sdk.KindPermissionDenied {
+		return TestResponse{Status: TestStatusAuthError, Reachable: true, Cause: cause}
+	}
+	var apiErr *sdk.APIError
+	if errors.As(err, &apiErr) {
+		return TestResponse{Status: TestStatusUnverified, Reachable: true, Cause: cause}
+	}
+	return TestResponse{Status: TestStatusError, Cause: cause}
+}
+
+// FetchRemoteModels fetches available models from the provider using the Twilight AI SDK.
+func (s *Service) FetchRemoteModels(ctx context.Context, id string) ([]RemoteModel, error) {
+	providerID, err := db.ParseUUID(id)
+	if err != nil {
+		return nil, err
+	}
+
+	provider, err := s.queries.GetProviderByID(ctx, providerID)
+	if err != nil {
+		return nil, errs.Wrap(err, "get provider")
+	}
+
+	clientType := models.ClientType(provider.ClientType)
+	switch clientType {
+	case models.ClientTypeOpenAICodex:
+		return s.fetchCodexRemoteModels(ctx, provider)
+	case models.ClientTypeGitHubCopilot:
+		return s.fetchGitHubCopilotModels(ctx, provider)
+	}
+
+	return s.fetchRemoteModelsViaSDK(ctx, provider)
+}
+
+// fetchTemplateModels returns the curated template/catalog entries for a
+// provider, when one is associated. The list describes CAPABILITIES of known
+// models, never which models this endpoint actually serves: callers must treat
+// it as lookup-by-ID metadata, not as the model list (an empty template like
+// New API must not short-circuit the remote /models call).
+func (s *Service) fetchTemplateModels(ctx context.Context, provider sqlc.Provider) ([]RemoteModel, bool) {
+	if provider.ProviderTemplateID.Valid {
+		models, err := s.queries.ListProviderTemplateModels(ctx, provider.ProviderTemplateID)
+		if err == nil {
+			return remoteModelsFromCatalog(models), true
+		}
+		if s.logger != nil {
+			s.logger.WarnContext(ctx, "failed to load provider template model catalog", slog.Any("error", err))
+		}
+	}
+	source := metadataSectionSource(providerMetadata(provider.Metadata), "preset")
+	if source == "" {
+		return nil, false
+	}
+	source = strings.ToLower(strings.TrimSpace(source))
+	if strings.TrimSpace(s.templatesDir) == "" {
+		return nil, false
+	}
+
+	defs, err := registry.Load(s.logger, s.templatesDir)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.WarnContext(ctx, "failed to load provider template models", slog.String("template_source", source), slog.Any("error", err))
+		}
+		return nil, false
+	}
+	for _, def := range defs {
+		if strings.EqualFold(def.Source, source) {
+			return remoteModelsFromTemplate(def), true
+		}
+	}
+	return nil, false
+}
+
+func remoteModelsFromCatalog(items []sqlc.TemplateProviderTemplateModel) []RemoteModel {
+	out := make([]RemoteModel, 0, len(items))
+	for _, model := range items {
+		cfg := providerConfig(model.Config)
+		out = append(out, RemoteModel{
+			ID:                  model.ModelID,
+			Name:                model.Name,
+			Description:         configStringPtr(cfg, "description"),
+			Type:                model.Type,
+			Compatibilities:     configStringSlice(cfg, "compatibilities"),
+			ReasoningEfforts:    configStringSlice(cfg, "reasoning_efforts"),
+			ThinkingMode:        configString(cfg, "thinking_mode"),
+			ReasoningDialect:    configString(cfg, "reasoning_dialect"),
+			ReasoningOffSupport: configString(cfg, "reasoning_off_support"),
+			ReasoningDefaultOn:  configBoolPtr(cfg, "reasoning_default_on"),
+			ThinkingBudgetMin:   configNonNegativeIntPtr(cfg, "thinking_budget_min"),
+			ThinkingBudgetMax:   configIntPtr(cfg, "thinking_budget_max"),
+			ContextWindow:       configIntPtr(cfg, "context_window"),
+			MaxOutputTokens:     configIntPtr(cfg, "max_output_tokens"),
+			Dimensions:          configIntPtr(cfg, "dimensions"),
+			CapabilitiesKnown:   true,
+		})
+	}
+	return out
+}
+
+func remoteModelsFromTemplate(def registry.ProviderDefinition) []RemoteModel {
+	out := make([]RemoteModel, 0, len(def.Models))
+	for _, model := range def.Models {
+		modelType := strings.TrimSpace(model.Type)
+		if modelType == "" {
+			modelType = string(models.ModelTypeChat)
+		}
+		cfg := model.Config
+		out = append(out, RemoteModel{
+			ID:                  model.ModelID,
+			Name:                model.Name,
+			Description:         configStringPtr(cfg, "description"),
+			Type:                modelType,
+			Compatibilities:     configStringSlice(cfg, "compatibilities"),
+			ReasoningEfforts:    configStringSlice(cfg, "reasoning_efforts"),
+			ThinkingMode:        configString(cfg, "thinking_mode"),
+			ReasoningDialect:    configString(cfg, "reasoning_dialect"),
+			ReasoningOffSupport: configString(cfg, "reasoning_off_support"),
+			ReasoningDefaultOn:  configBoolPtr(cfg, "reasoning_default_on"),
+			ThinkingBudgetMin:   configNonNegativeIntPtr(cfg, "thinking_budget_min"),
+			ThinkingBudgetMax:   configIntPtr(cfg, "thinking_budget_max"),
+			ContextWindow:       configIntPtr(cfg, "context_window"),
+			MaxOutputTokens:     configIntPtr(cfg, "max_output_tokens"),
+			Dimensions:          configIntPtr(cfg, "dimensions"),
+			CapabilitiesKnown:   true,
+		})
+	}
+	return out
+}
+
+func (s *Service) fetchRemoteModelsViaSDK(ctx context.Context, provider sqlc.Provider) ([]RemoteModel, error) {
+	cfg := providerConfig(provider.Config)
+	baseURL := strings.TrimRight(configString(cfg, "base_url"), "/")
+	clientType := models.ClientType(provider.ClientType)
+
+	if clientType == models.ClientTypeAnthropicMessages && baseURL != "" && !strings.HasSuffix(baseURL, "/v1") {
+		baseURL += "/v1"
+	}
+
+	creds, err := s.ResolveModelCredentials(ctx, provider)
+	if err != nil {
+		return nil, fmt.Errorf("resolve credentials: %w", err)
+	}
+
+	sdkProvider := models.NewSDKProvider(baseURL, creds.APIKey, creds.CodexAccountID, clientType, probeTimeout, nil)
+
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+
+	sdkModels, err := sdkProvider.ListModels(ctx)
+	if err != nil {
+		return nil, errs.WrapDependency(err, "list models")
+	}
+
+	// Best-effort capability lookup: template/catalog entries keyed by model ID
+	// enrich the models the endpoint actually serves; they never add, remove,
+	// or substitute entries (a gateway like New API decides its own list).
+	templatesByID := make(map[string]RemoteModel)
+	if templateModels, ok := s.fetchTemplateModels(ctx, provider); ok {
+		for _, model := range templateModels {
+			templatesByID[model.ID] = model
 		}
 	}
 
-	// Mask API key (show only first 8 characters)
-	maskedAPIKey := maskAPIKey(provider.ApiKey)
+	liveMaxOutput := fetchMaxOutputTokens(ctx, clientType, baseURL, creds.APIKey)
+
+	remoteModels := make([]RemoteModel, 0, len(sdkModels))
+	for _, m := range sdkModels {
+		template, found := templatesByID[m.ID]
+		modelType := m.Type
+		if found {
+			switch template.Type {
+			case string(sdk.ModelTypeChat), string(sdk.ModelTypeEmbedding):
+				// List endpoints often lack real per-model types (the OpenAI
+				// protocol has none, so completions/responses hardcode chat);
+				// the curated template type wins for a known model ID, e.g.
+				// text-embedding-* must survive as embedding with dimensions.
+				modelType = sdk.ModelType(template.Type)
+			}
+		}
+		if modelType == "" {
+			modelType = sdk.ModelTypeChat
+		}
+		if modelType != sdk.ModelTypeChat && modelType != sdk.ModelTypeEmbedding {
+			continue
+		}
+		name := m.DisplayName
+		if name == "" {
+			name = m.ID
+		}
+		var dimensions *int
+		if modelType == sdk.ModelTypeEmbedding {
+			switch {
+			case found && template.Dimensions != nil:
+				// The template already curates this model's dimensions; a live
+				// probe would spend tokens and can spuriously fail on gateways
+				// whose key lacks embedding permission.
+				dimensions = template.Dimensions
+			default:
+				dim, err := models.InferEmbeddingDimensions(ctx, string(clientType), baseURL, creds.APIKey, m.ID, probeTimeout, nil)
+				if err != nil {
+					logger := s.logger
+					if logger == nil {
+						logger = slog.Default()
+					}
+					logger.WarnContext(ctx, "skip embedding model import because dimensions probe failed", slog.String("model_id", m.ID), slog.Any("error", err))
+					continue
+				}
+				dimensions = &dim
+			}
+		}
+		remote := RemoteModel{
+			ID:         m.ID,
+			Name:       name,
+			Type:       string(modelType),
+			Dimensions: dimensions,
+		}
+		if found {
+			// The live endpoint keeps deciding the list; curated fields fill in.
+			if template.Name != "" {
+				remote.Name = template.Name
+			}
+			remote.Description = template.Description
+			remote.Compatibilities = template.Compatibilities
+			remote.ReasoningEfforts = template.ReasoningEfforts
+			remote.ThinkingMode = template.ThinkingMode
+			remote.ReasoningDialect = template.ReasoningDialect
+			remote.ReasoningOffSupport = template.ReasoningOffSupport
+			remote.ReasoningDefaultOn = template.ReasoningDefaultOn
+			remote.ThinkingBudgetMin = template.ThinkingBudgetMin
+			remote.ThinkingBudgetMax = template.ThinkingBudgetMax
+			remote.ContextWindow = template.ContextWindow
+			remote.MaxOutputTokens = template.MaxOutputTokens
+			remote.CapabilitiesKnown = true
+		} else if clientType == models.ClientTypeOpenCodeGo {
+			remote.Compatibilities = []string{models.CompatToolCall, models.CompatReasoning}
+			remote.ThinkingMode = models.ThinkingModeAlways
+			remote.CapabilitiesKnown = true
+		}
+		// An explicit value from the endpoint is fresher than the template's.
+		if limit, ok := liveMaxOutput[m.ID]; ok {
+			remote.MaxOutputTokens = &limit
+		}
+		remoteModels = append(remoteModels, remote)
+	}
+	return remoteModels, nil
+}
+
+// fetchMaxOutputTokens reads the optional max_output_tokens field that an
+// OpenAI-compatible /models endpoint may attach to each entry; the SDK's model
+// list keeps only ids. It is best effort: any failure, or an entry without a
+// positive integer, leaves the model's limit unknown.
+func fetchMaxOutputTokens(ctx context.Context, clientType models.ClientType, baseURL, apiKey string) map[string]int {
+	if clientType != models.ClientTypeOpenAICompletions && clientType != models.ClientTypeOpenAIResponses {
+		return nil
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/models", nil)
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("Accept", "application/json")
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	resp, err := models.NewProviderHTTPClient(probeTimeout).Do(req) //nolint:gosec // The URL is the provider's own configured base URL, like the SDK's list request.
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	var body struct {
+		Data []struct {
+			ID              string `json:"id"`
+			MaxOutputTokens *int   `json:"max_output_tokens"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, remoteModelsResponseLimit)).Decode(&body); err != nil {
+		return nil
+	}
+	limits := make(map[string]int)
+	for _, item := range body.Data {
+		if item.MaxOutputTokens != nil && *item.MaxOutputTokens > 0 {
+			limits[item.ID] = *item.MaxOutputTokens
+		}
+	}
+	return limits
+}
+
+// toGetResponse converts a database provider to a response.
+func (s *Service) toGetResponse(provider sqlc.Provider) GetResponse {
+	var metadata map[string]any
+	if len(provider.Metadata) > 0 {
+		if err := json.Unmarshal(provider.Metadata, &metadata); err != nil {
+			if s.logger != nil {
+				s.logger.Warn("provider metadata unmarshal failed", slog.String("id", provider.ID.String()), slog.Any("error", err))
+			}
+		}
+	}
+
+	cfg := providerConfig(provider.Config)
+	maskedCfg := maskConfigSecrets(provider.ClientType, cfg)
+
+	var icon string
+	if provider.Icon.Valid {
+		icon = provider.Icon.String
+	}
+	// Instances created before the Go preset had an icon retain an empty value.
+	if icon == "" && provider.ClientType == string(models.ClientTypeOpenCodeGo) {
+		icon = "opencode-go"
+	}
+	var templateID string
+	if provider.ProviderTemplateID.Valid {
+		templateID = provider.ProviderTemplateID.String()
+	}
 
 	return GetResponse{
-		ID:         provider.ID.String(),
-		Name:       provider.Name,
-		ClientType: provider.ClientType,
-		BaseURL:    provider.BaseUrl,
-		APIKey:     maskedAPIKey,
-		Metadata:   metadata,
-		CreatedAt:  provider.CreatedAt.Time,
-		UpdatedAt:  provider.UpdatedAt.Time,
+		ID:                 provider.ID.String(),
+		ProviderTemplateID: templateID,
+		Name:               provider.Name,
+		ClientType:         provider.ClientType,
+		Icon:               icon,
+		Enable:             provider.Enable,
+		Config:             maskedCfg,
+		Metadata:           metadata,
+		CreatedAt:          provider.CreatedAt.Time,
+		UpdatedAt:          provider.UpdatedAt.Time,
 	}
 }
 
-// isValidClientType checks if a client type is valid
-func isValidClientType(clientType ClientType) bool {
-	switch clientType {
-	case ClientTypeOpenAI, ClientTypeOpenAICompat, ClientTypeAnthropic, ClientTypeGoogle,
-		ClientTypeAzure, ClientTypeBedrock, ClientTypeMistral, ClientTypeXAI,
-		ClientTypeOllama, ClientTypeDashscope:
-		return true
+// providerConfig parses the provider config JSONB.
+func providerConfig(raw []byte) map[string]any {
+	if len(raw) == 0 {
+		return map[string]any{}
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return map[string]any{}
+	}
+	if cfg == nil {
+		return map[string]any{}
+	}
+	return cfg
+}
+
+// configString extracts a string from the config map.
+func configString(cfg map[string]any, key string) string {
+	if cfg == nil {
+		return ""
+	}
+	v, _ := cfg[key].(string)
+	return v
+}
+
+func configStringSlice(cfg map[string]any, key string) []string {
+	if cfg == nil {
+		return nil
+	}
+	switch value := cfg[key].(type) {
+	case []string:
+		return append([]string(nil), value...)
+	case []any:
+		out := make([]string, 0, len(value))
+		for _, item := range value {
+			if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+				out = append(out, s)
+			}
+		}
+		return out
 	default:
-		return false
+		return nil
 	}
 }
 
-// maskAPIKey masks an API key for security
-func maskAPIKey(apiKey string) string {
+func configStringPtr(cfg map[string]any, key string) *string {
+	if cfg == nil {
+		return nil
+	}
+	value, ok := cfg[key].(string)
+	if !ok {
+		return nil
+	}
+	value = strings.TrimSpace(value)
+	return &value
+}
+
+func configIntPtr(cfg map[string]any, key string) *int {
+	if cfg == nil {
+		return nil
+	}
+	switch value := cfg[key].(type) {
+	case int:
+		if value > 0 {
+			return &value
+		}
+	case int64:
+		if value > 0 {
+			out := int(value)
+			return &out
+		}
+	case float64:
+		if value > 0 {
+			out := int(value)
+			return &out
+		}
+	}
+	return nil
+}
+
+func configNonNegativeIntPtr(cfg map[string]any, key string) *int {
+	if cfg == nil {
+		return nil
+	}
+	switch value := cfg[key].(type) {
+	case int:
+		if value >= 0 {
+			return &value
+		}
+	case int64:
+		if value >= 0 {
+			out := int(value)
+			return &out
+		}
+	case float64:
+		if value >= 0 {
+			out := int(value)
+			return &out
+		}
+	}
+	return nil
+}
+
+// ProviderConfigString is a public helper for extracting a string from the config JSONB.
+func ProviderConfigString(provider sqlc.Provider, key string) string {
+	return configString(providerConfig(provider.Config), key)
+}
+
+func cloneConfig(cfg map[string]any) map[string]any {
+	result := make(map[string]any, len(cfg))
+	for k, v := range cfg {
+		result[k] = v
+	}
+	return result
+}
+
+func mergeProviderConfig(existing, incoming map[string]any) map[string]any {
+	result := cloneConfig(existing)
+	for k, v := range incoming {
+		result[k] = v
+	}
+	return result
+}
+
+func preserveMaskedConfigSecret(merged, existing, incoming map[string]any, key string) {
+	existingValue := strings.TrimSpace(configString(existing, key))
+	newValue := strings.TrimSpace(configString(incoming, key))
+	if existingValue == "" || newValue == "" {
+		return
+	}
+	if newValue == MaskAPIKey(existingValue) {
+		merged[key] = existingValue
+	}
+}
+
+// normalizeProviderConfig keeps provider-specific secrets under stable keys while
+// preserving backward compatibility for legacy stored configs.
+func normalizeProviderConfig(clientType string, cfg map[string]any) map[string]any {
+	result := cloneConfig(cfg)
+	if models.ClientType(clientType) == models.ClientTypeGitHubCopilot {
+		delete(result, "api_key")
+		delete(result, configOAuthClientSecretKey)
+	}
+	return result
+}
+
+// maskConfigSecrets returns a copy of config with all known secret fields masked.
+func maskConfigSecrets(clientType string, cfg map[string]any) map[string]any {
+	result := normalizeProviderConfig(clientType, cfg)
+	for _, key := range SecretConfigKeys {
+		if value, _ := result[key].(string); value != "" {
+			result[key] = MaskAPIKey(value)
+		}
+	}
+	return result
+}
+
+// SecretConfigKeys is the single registry of provider-config fields that hold
+// secrets. Every read surface that masks (here and the audio speech/
+// transcription endpoints) and every write surface that preserves masked
+// round-trips must draw from THIS list and mask with MaskAPIKey — the speech
+// endpoints once masked with their own shape, and any voice-settings save
+// then wrote the masked literal back over the real key.
+var SecretConfigKeys = []string{"api_key", configOAuthClientSecretKey, "access_key", "secret_key", "app_key"}
+
+// MaskAPIKey masks an API key for security.
+func MaskAPIKey(apiKey string) string {
 	if apiKey == "" {
 		return ""
 	}
@@ -251,14 +853,70 @@ func maskAPIKey(apiKey string) string {
 	return apiKey[:8] + strings.Repeat("*", len(apiKey)-8)
 }
 
-// resolveUpdatedAPIKey keeps the original key when the request value matches the masked version.
-// This prevents masked placeholder values from overwriting the real stored credential.
-func resolveUpdatedAPIKey(existing string, updated *string) string {
-	if updated == nil {
-		return existing
+func (s *Service) activateHiddenRegistryTemplate(
+	ctx context.Context,
+	req CreateRequest,
+	clientType string,
+	icon pgtype.Text,
+	configJSON []byte,
+	metadataJSON []byte,
+) (sqlc.Provider, bool, error) {
+	existing, err := s.queries.GetProviderByName(ctx, req.Name)
+	if err != nil {
+		return sqlc.Provider{}, false, nil
 	}
-	if *updated == maskAPIKey(existing) {
-		return existing
+	if !isHiddenRegistryTemplate(existing) {
+		return sqlc.Provider{}, false, nil
 	}
-	return *updated
+	if !icon.Valid {
+		icon = existing.Icon
+	}
+
+	updated, err := s.queries.UpdateProvider(ctx, sqlc.UpdateProviderParams{
+		ID:         existing.ID,
+		Name:       req.Name,
+		ClientType: clientType,
+		Icon:       icon,
+		Enable:     true,
+		Config:     configJSON,
+		Metadata:   metadataJSON,
+	})
+	if err != nil {
+		return sqlc.Provider{}, true, errs.Wrap(err, "activate registry provider template")
+	}
+	return updated, true, nil
+}
+
+func isHiddenRegistryTemplate(provider sqlc.Provider) bool {
+	if provider.Enable || registryMetadataSource(provider.Metadata) == "" {
+		return false
+	}
+	cfg := providerConfig(provider.Config)
+	return strings.TrimSpace(configString(cfg, "api_key")) == "" &&
+		strings.TrimSpace(configString(cfg, configOAuthClientSecretKey)) == ""
+}
+
+func registryMetadataSource(raw []byte) string {
+	return metadataSectionSource(providerMetadata(raw), registryMetadataKey)
+}
+
+func metadataSectionSource(metadata map[string]any, section string) string {
+	nested, _ := metadata[section].(map[string]any)
+	if nested == nil {
+		return ""
+	}
+	return strings.TrimSpace(stringValue(nested, metadataSourceKey))
+}
+
+// configBoolPtr reads an optional boolean, distinguishing "absent" from "false".
+// reasoning_default_on needs that distinction: unknown means the adaptor keeps its
+// conservative behaviour, while an explicit false is a fact about the model.
+func configBoolPtr(cfg map[string]any, key string) *bool {
+	if cfg == nil {
+		return nil
+	}
+	if value, ok := cfg[key].(bool); ok {
+		return &value
+	}
+	return nil
 }

@@ -1,6 +1,30 @@
 package feishu
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
+
+func TestSelfIdentityPolicyRequiresVerificationBeforeEnable(t *testing.T) {
+	t.Parallel()
+
+	policy := (&FeishuAdapter{}).SelfIdentityPolicy()
+	if !policy.RequireDiscoveryOnEnable {
+		t.Fatal("expected Feishu to require identity discovery before enable")
+	}
+	if !policy.RefreshOnCredentialsChange {
+		t.Fatal("expected Feishu to refresh identity after credentials change")
+	}
+	if policy.RequiredSelfIdentityKey != "open_id" {
+		t.Fatalf("required identity key = %q, want open_id", policy.RequiredSelfIdentityKey)
+	}
+	if policy.DiscoveryErrorMessage == "" || policy.MissingIdentityMessage == "" {
+		t.Fatal("expected stable Feishu discovery failure messages")
+	}
+	if feishuDiscoveryTimeout <= 0 || feishuDiscoveryTimeout > 30*time.Second {
+		t.Fatalf("discovery timeout = %v, want a bounded user-facing verification", feishuDiscoveryTimeout)
+	}
+}
 
 func TestNormalizeConfig(t *testing.T) {
 	t.Parallel()
@@ -20,6 +44,12 @@ func TestNormalizeConfig(t *testing.T) {
 	if got["encryptKey"] != "enc" || got["verificationToken"] != "verify" {
 		t.Fatalf("unexpected feishu security config: %#v", got)
 	}
+	if got["region"] != regionFeishu {
+		t.Fatalf("unexpected default region: %#v", got["region"])
+	}
+	if got["inboundMode"] != inboundModeWebsocket {
+		t.Fatalf("unexpected default inbound mode: %#v", got["inboundMode"])
+	}
 }
 
 func TestNormalizeConfigRequiresApp(t *testing.T) {
@@ -28,6 +58,66 @@ func TestNormalizeConfigRequiresApp(t *testing.T) {
 	_, err := normalizeConfig(map[string]any{})
 	if err == nil {
 		t.Fatalf("expected error, got nil")
+	}
+}
+
+func TestNormalizeConfigSupportsLarkAndWebhook(t *testing.T) {
+	t.Parallel()
+
+	got, err := normalizeConfig(map[string]any{
+		"app_id":       "app",
+		"app_secret":   "secret",
+		"region":       "lark",
+		"inbound_mode": "webhook",
+		"encrypt_key":  "enc",
+	})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if got["region"] != regionLark {
+		t.Fatalf("unexpected region: %#v", got["region"])
+	}
+	if got["inboundMode"] != inboundModeWebhook {
+		t.Fatalf("unexpected inbound mode: %#v", got["inboundMode"])
+	}
+}
+
+func TestNormalizeConfigRejectsWebhookWithoutSecrets(t *testing.T) {
+	t.Parallel()
+
+	_, err := normalizeConfig(map[string]any{
+		"app_id":       "app",
+		"app_secret":   "secret",
+		"inbound_mode": "webhook",
+	})
+	if err == nil {
+		t.Fatal("expected webhook secret error")
+	}
+}
+
+func TestNormalizeConfigRejectsInvalidRegion(t *testing.T) {
+	t.Parallel()
+
+	_, err := normalizeConfig(map[string]any{
+		"app_id":     "app",
+		"app_secret": "secret",
+		"region":     "unknown",
+	})
+	if err == nil {
+		t.Fatal("expected invalid region error")
+	}
+}
+
+func TestNormalizeConfigRejectsInvalidInboundMode(t *testing.T) {
+	t.Parallel()
+
+	_, err := normalizeConfig(map[string]any{
+		"app_id":       "app",
+		"app_secret":   "secret",
+		"inbound_mode": "invalid",
+	})
+	if err == nil {
+		t.Fatal("expected invalid inbound_mode error")
 	}
 }
 

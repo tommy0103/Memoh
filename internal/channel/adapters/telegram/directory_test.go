@@ -4,9 +4,9 @@ import (
 	"strconv"
 	"testing"
 
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	tele "gopkg.in/telebot.v4"
 
-	"github.com/memohai/memoh/internal/channel"
+	"github.com/felinics/memoh/internal/channel"
 )
 
 func Test_directoryLimit(t *testing.T) {
@@ -32,8 +32,8 @@ func Test_directoryLimit(t *testing.T) {
 
 func Test_parseTelegramChatInput(t *testing.T) {
 	tests := []struct {
-		input string
-		wantID int64
+		input        string
+		wantID       int64
 		wantUsername string
 	}{
 		{"123456789", 123456789, ""},
@@ -74,7 +74,7 @@ func Test_parseTelegramUserInput(t *testing.T) {
 }
 
 func Test_telegramUserToEntry(t *testing.T) {
-	u := &tgbotapi.User{ID: 123, UserName: "alice", FirstName: "Alice", LastName: "Smith"}
+	u := &tele.User{ID: 123, Username: "alice", FirstName: "Alice", LastName: "Smith"}
 	e := telegramUserToEntry(u)
 	if e.Kind != channel.DirectoryEntryUser {
 		t.Errorf("Kind = %q", e.Kind)

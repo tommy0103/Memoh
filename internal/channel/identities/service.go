@@ -11,22 +11,21 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"github.com/memohai/memoh/internal/db"
-	"github.com/memohai/memoh/internal/db/sqlc"
+	"github.com/felinics/memoh/internal/db"
+	"github.com/felinics/memoh/internal/db/postgres/sqlc"
+	dbstore "github.com/felinics/memoh/internal/db/store"
 )
 
 // Service provides channel identity lifecycle operations.
 type Service struct {
-	queries *sqlc.Queries
+	queries dbstore.Queries
 	logger  *slog.Logger
 }
 
-var (
-	ErrChannelIdentityNotFound = errors.New("channel identity not found")
-)
+var ErrChannelIdentityNotFound = errors.New("channel identity not found")
 
 // NewService creates a new channel identity service.
-func NewService(log *slog.Logger, queries *sqlc.Queries) *Service {
+func NewService(log *slog.Logger, queries dbstore.Queries) *Service {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -39,15 +38,14 @@ func NewService(log *slog.Logger, queries *sqlc.Queries) *Service {
 // Create creates a new channel identity for the given channel subject.
 func (s *Service) Create(ctx context.Context, channel, channelSubjectID, displayName string) (ChannelIdentity, error) {
 	if s.queries == nil {
-		return ChannelIdentity{}, fmt.Errorf("channel identity queries not configured")
+		return ChannelIdentity{}, errors.New("channel identity queries not configured")
 	}
 	channel = normalizeChannel(channel)
 	channelSubjectID = strings.TrimSpace(channelSubjectID)
 	if channel == "" || channelSubjectID == "" {
-		return ChannelIdentity{}, fmt.Errorf("channel and channel_subject_id are required")
+		return ChannelIdentity{}, errors.New("channel and channel_subject_id are required")
 	}
 	row, err := s.queries.CreateChannelIdentity(ctx, sqlc.CreateChannelIdentityParams{
-		UserID:           pgtype.UUID{},
 		ChannelType:      channel,
 		ChannelSubjectID: channelSubjectID,
 		DisplayName:      toPgText(displayName),
@@ -63,7 +61,7 @@ func (s *Service) Create(ctx context.Context, channel, channelSubjectID, display
 // GetByID returns a channel identity by its ID.
 func (s *Service) GetByID(ctx context.Context, channelIdentityID string) (ChannelIdentity, error) {
 	if s.queries == nil {
-		return ChannelIdentity{}, fmt.Errorf("channel identity queries not configured")
+		return ChannelIdentity{}, errors.New("channel identity queries not configured")
 	}
 	pgID, err := db.ParseUUID(channelIdentityID)
 	if err != nil {
@@ -82,7 +80,7 @@ func (s *Service) GetByID(ctx context.Context, channelIdentityID string) (Channe
 // Canonicalize validates and returns the same channel identity ID.
 func (s *Service) Canonicalize(ctx context.Context, channelIdentityID string) (string, error) {
 	if s.queries == nil {
-		return "", fmt.Errorf("channel identity queries not configured")
+		return "", errors.New("channel identity queries not configured")
 	}
 	pgID, err := db.ParseUUID(channelIdentityID)
 	if err != nil {
@@ -102,12 +100,12 @@ func (s *Service) Canonicalize(ctx context.Context, channelIdentityID string) (s
 // Optional meta may contain avatar_url which is stored as a dedicated column.
 func (s *Service) ResolveByChannelIdentity(ctx context.Context, channel, channelSubjectID, displayName string, meta map[string]any) (ChannelIdentity, error) {
 	if s.queries == nil {
-		return ChannelIdentity{}, fmt.Errorf("channel identity queries not configured")
+		return ChannelIdentity{}, errors.New("channel identity queries not configured")
 	}
 	channel = normalizeChannel(channel)
 	channelSubjectID = strings.TrimSpace(channelSubjectID)
 	if channel == "" || channelSubjectID == "" {
-		return ChannelIdentity{}, fmt.Errorf("channel and channel_subject_id are required")
+		return ChannelIdentity{}, errors.New("channel and channel_subject_id are required")
 	}
 
 	avatarURL := ""
@@ -118,7 +116,6 @@ func (s *Service) ResolveByChannelIdentity(ctx context.Context, channel, channel
 	}
 
 	row, err := s.queries.UpsertChannelIdentityByChannelSubject(ctx, sqlc.UpsertChannelIdentityByChannelSubjectParams{
-		UserID:           pgtype.UUID{},
 		ChannelType:      channel,
 		ChannelSubjectID: channelSubjectID,
 		DisplayName:      toPgText(displayName),
@@ -134,7 +131,7 @@ func (s *Service) ResolveByChannelIdentity(ctx context.Context, channel, channel
 // UpsertChannelIdentity creates or updates a channel identity mapping.
 func (s *Service) UpsertChannelIdentity(ctx context.Context, channel, channelSubjectID, displayName string, metadata map[string]any) (ChannelIdentity, error) {
 	if s.queries == nil {
-		return ChannelIdentity{}, fmt.Errorf("channel identity queries not configured")
+		return ChannelIdentity{}, errors.New("channel identity queries not configured")
 	}
 	channel = normalizeChannel(channel)
 	channelSubjectID = strings.TrimSpace(channelSubjectID)
@@ -150,7 +147,6 @@ func (s *Service) UpsertChannelIdentity(ctx context.Context, channel, channelSub
 		avatarURL = strings.TrimSpace(fmt.Sprint(raw))
 	}
 	row, err := s.queries.UpsertChannelIdentityByChannelSubject(ctx, sqlc.UpsertChannelIdentityByChannelSubjectParams{
-		UserID:           pgtype.UUID{},
 		ChannelType:      channel,
 		ChannelSubjectID: channelSubjectID,
 		DisplayName:      toPgText(displayName),
@@ -163,10 +159,10 @@ func (s *Service) UpsertChannelIdentity(ctx context.Context, channel, channelSub
 	return toChannelIdentity(row), nil
 }
 
-// ListCanonicalChannelIdentities lists channel identities under the same linked user.
+// ListCanonicalChannelIdentities returns the requested channel identity.
 func (s *Service) ListCanonicalChannelIdentities(ctx context.Context, channelIdentityID string) ([]ChannelIdentity, error) {
 	if s.queries == nil {
-		return nil, fmt.Errorf("channel identity queries not configured")
+		return nil, errors.New("channel identity queries not configured")
 	}
 	pgChannelIdentityID, err := db.ParseUUID(channelIdentityID)
 	if err != nil {
@@ -179,94 +175,73 @@ func (s *Service) ListCanonicalChannelIdentities(ctx context.Context, channelIde
 		}
 		return nil, err
 	}
-	if !row.UserID.Valid {
-		return []ChannelIdentity{toChannelIdentity(row)}, nil
-	}
-	rows, err := s.queries.ListChannelIdentitiesByUserID(ctx, row.UserID)
-	if err != nil {
-		return nil, err
-	}
-	result := make([]ChannelIdentity, 0, len(rows))
-	for _, item := range rows {
-		result = append(result, toChannelIdentity(item))
-	}
-	return result, nil
+	return []ChannelIdentity{toChannelIdentity(row)}, nil
 }
 
-// ListUserChannelIdentities lists all channel identities linked to a user.
-func (s *Service) ListUserChannelIdentities(ctx context.Context, userID string) ([]ChannelIdentity, error) {
+// ListUserIDsByChannelIdentity returns account user IDs currently linked to a
+// channel identity. Callers that need a runtime owner should require exactly one
+// result; an unbound or ambiguously bound channel identity cannot safely own a
+// workspace runtime.
+func (s *Service) ListUserIDsByChannelIdentity(ctx context.Context, channelIdentityID string) ([]string, error) {
 	if s.queries == nil {
-		return nil, fmt.Errorf("channel identity queries not configured")
-	}
-	pgUserID, err := db.ParseUUID(userID)
-	if err != nil {
-		return nil, err
-	}
-	rows, err := s.queries.ListChannelIdentitiesByUserID(ctx, pgUserID)
-	if err != nil {
-		return nil, err
-	}
-	result := make([]ChannelIdentity, 0, len(rows))
-	for _, row := range rows {
-		result = append(result, toChannelIdentity(row))
-	}
-	return result, nil
-}
-
-// GetLinkedUserID returns the linked user ID for a channel identity.
-func (s *Service) GetLinkedUserID(ctx context.Context, channelIdentityID string) (string, error) {
-	if s.queries == nil {
-		return "", fmt.Errorf("channel identity queries not configured")
+		return nil, errors.New("channel identity queries not configured")
 	}
 	pgChannelIdentityID, err := db.ParseUUID(channelIdentityID)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	row, err := s.queries.GetChannelIdentityByID(ctx, pgChannelIdentityID)
+	rows, err := s.queries.ListUserIDsByChannelIdentity(ctx, pgChannelIdentityID)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return "", nil
+		return nil, err
+	}
+	out := make([]string, 0, len(rows))
+	for _, id := range rows {
+		userID := strings.TrimSpace(id.String())
+		if userID != "" {
+			out = append(out, userID)
 		}
-		return "", err
 	}
-	if !row.UserID.Valid {
-		return "", nil
-	}
-	return row.UserID.String(), nil
+	return out, nil
 }
 
-// LinkChannelIdentityToUser binds a channel identity to a user.
-func (s *Service) LinkChannelIdentityToUser(ctx context.Context, channelIdentityID, userID string) error {
+// Search returns locally observed channel identities for UI search.
+func (s *Service) Search(ctx context.Context, query string, limit int) ([]SearchResult, error) {
 	if s.queries == nil {
-		return fmt.Errorf("channel identity queries not configured")
+		return nil, errors.New("channel identity queries not configured")
 	}
-	pgChannelIdentityID, err := db.ParseUUID(channelIdentityID)
-	if err != nil {
-		return err
+	if limit <= 0 {
+		limit = 50
 	}
-	pgUserID, err := db.ParseUUID(userID)
-	if err != nil {
-		return err
-	}
-	_, err = s.queries.SetChannelIdentityLinkedUser(ctx, sqlc.SetChannelIdentityLinkedUserParams{
-		ID:     pgChannelIdentityID,
-		UserID: pgUserID,
+	rows, err := s.queries.SearchChannelIdentities(ctx, sqlc.SearchChannelIdentitiesParams{
+		Query:      strings.TrimSpace(query),
+		LimitCount: int32(limit), //nolint:gosec // limit is capped above
 	})
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrChannelIdentityNotFound
-		}
-		return err
+		return nil, err
 	}
-	return nil
+	items := make([]SearchResult, 0, len(rows))
+	for _, row := range rows {
+		item := SearchResult{
+			ChannelIdentity: toChannelIdentity(sqlc.ChannelIdentity{
+				ID:               row.ID,
+				ChannelType:      row.ChannelType,
+				ChannelSubjectID: row.ChannelSubjectID,
+				DisplayName:      row.DisplayName,
+				AvatarUrl:        row.AvatarUrl,
+				Metadata:         row.Metadata,
+				CreatedAt:        row.CreatedAt,
+				UpdatedAt:        row.UpdatedAt,
+			}),
+		}
+		items = append(items, item)
+	}
+	return items, nil
 }
 
 func toChannelIdentity(row sqlc.ChannelIdentity) ChannelIdentity {
 	var metadata map[string]any
 	if len(row.Metadata) > 0 {
-		if err := json.Unmarshal(row.Metadata, &metadata); err != nil {
-			slog.Warn("unmarshal channel identity metadata failed", slog.String("id", row.ID.String()), slog.Any("error", err))
-		}
+		_ = json.Unmarshal(row.Metadata, &metadata)
 	}
 	if metadata == nil {
 		metadata = map[string]any{}
@@ -279,13 +254,8 @@ func toChannelIdentity(row sqlc.ChannelIdentity) ChannelIdentity {
 	if row.AvatarUrl.Valid {
 		avatarURL = strings.TrimSpace(row.AvatarUrl.String)
 	}
-	userID := ""
-	if row.UserID.Valid {
-		userID = row.UserID.String()
-	}
 	return ChannelIdentity{
 		ID:               row.ID.String(),
-		UserID:           userID,
 		Channel:          row.ChannelType,
 		ChannelSubjectID: row.ChannelSubjectID,
 		DisplayName:      displayName,

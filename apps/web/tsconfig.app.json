@@ -1,0 +1,26 @@
+{
+  "extends": "@vue/tsconfig/tsconfig.dom.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo",
+    "types": ["vite/client"],
+    "lib": ["DOM","ESNext"],
+    /* Linting */
+    "strict": true,
+    // @vue/tsconfig 0.9.1 dropped this from its base (0.8.1 had it);
+    // pinned here to keep the TS 6 upgrade strictness-neutral.
+    "noUncheckedIndexedAccess": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedSideEffectImports": true,
+    "paths": {
+      "@/*": ["./src/*"],
+      // @felinic/ui is consumed as source and imports its own files through
+      // `#/`; mirror the `#` alias from vite.config.ts so those imports
+      // resolve when this program type-checks them.
+      "#/*": ["../../packages/ui/src/*"]
+    }
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "src/**/*.vue", "type.d.ts"],
+}

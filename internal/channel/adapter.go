@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
 	"sync/atomic"
 )
 
@@ -20,7 +21,15 @@ type StreamReplySender interface {
 	OpenStream(ctx context.Context, target string, opts StreamOptions) (OutboundStream, error)
 }
 
+// PreparedOutboundStream is the adapter-facing stream session.
+type PreparedOutboundStream interface {
+	Push(ctx context.Context, event PreparedStreamEvent) error
+	Close(ctx context.Context) error
+}
+
 // OutboundStream is a live stream session for emitting outbound events.
+// Implementations are not required to be safe for concurrent use; callers
+// must serialize Push and Close calls within a single goroutine.
 type OutboundStream interface {
 	Push(ctx context.Context, event StreamEvent) error
 	Close(ctx context.Context) error
@@ -72,12 +81,22 @@ type Adapter interface {
 	Descriptor() Descriptor
 }
 
-// Descriptor holds read-only metadata for a registered channel type.
-// It contains no behavior — all behavior is expressed through optional interfaces.
+// Descriptor holds read-only metadata and static policy flags for a registered
+// channel type. Request handling and platform operations are expressed through
+// optional interfaces.
 type Descriptor struct {
-	Type             ChannelType
-	DisplayName      string
-	Configless       bool
+	Type               ChannelType
+	DisplayName        string
+	Configless         bool
+	AckDisabledWebhook bool
+	// OwnerOnly marks channels that no third party can ever reach (e.g.
+	// personal-assistant channels living inside the activator's own
+	// account). Every sender on these channels is treated as the operator:
+	// an unlinked sender resolves to the bot owner's account (so gates keyed
+	// on the account principal, such as workspace exec and external runtimes,
+	// see the owner), and the gates keyed on the channel identity instead —
+	// chat ACL and write-gated slash commands — skip their /link requirement.
+	OwnerOnly        bool
 	Capabilities     ChannelCapabilities
 	OutboundPolicy   OutboundPolicy
 	ConfigSchema     ConfigSchema
@@ -105,17 +124,35 @@ type BindingMatcher interface {
 
 // Sender is an adapter capable of sending outbound messages.
 type Sender interface {
-	Send(ctx context.Context, cfg ChannelConfig, msg OutboundMessage) error
+	Send(ctx context.Context, cfg ChannelConfig, msg PreparedOutboundMessage) error
+}
+
+// PreparedOutboundValidator lets adapters reject platform-invalid prepared
+// messages before a batched/chunked send starts delivering earlier items.
+type PreparedOutboundValidator interface {
+	ValidatePreparedOutbound(ctx context.Context, cfg ChannelConfig, target string, msg PreparedOutboundMessage) error
+}
+
+// OutboundCapabilityResolver can refine static descriptor capabilities for a
+// specific outbound config and target when platform support is runtime-gated.
+type OutboundCapabilityResolver interface {
+	ResolveOutboundCapabilities(cfg ChannelConfig, target string, base ChannelCapabilities) ChannelCapabilities
+}
+
+// OutboundTargetResolver can resolve delivery aliases to the concrete platform
+// target before outbound capability checks run.
+type OutboundTargetResolver interface {
+	ResolveOutboundTarget(ctx context.Context, cfg ChannelConfig, target string) (string, error)
 }
 
 // StreamSender is an adapter capable of opening outbound stream sessions.
 type StreamSender interface {
-	OpenStream(ctx context.Context, cfg ChannelConfig, target string, opts StreamOptions) (OutboundStream, error)
+	OpenStream(ctx context.Context, cfg ChannelConfig, target string, opts StreamOptions) (PreparedOutboundStream, error)
 }
 
 // MessageEditor updates and deletes already-sent messages when supported.
 type MessageEditor interface {
-	Update(ctx context.Context, cfg ChannelConfig, target string, messageID string, msg Message) error
+	Update(ctx context.Context, cfg ChannelConfig, target string, messageID string, msg PreparedMessage) error
 	Unsend(ctx context.Context, cfg ChannelConfig, target string, messageID string) error
 }
 
@@ -131,9 +168,38 @@ type SelfDiscoverer interface {
 	DiscoverSelf(ctx context.Context, credentials map[string]any) (identity map[string]any, externalID string, err error)
 }
 
+// SelfIdentityPolicy describes adapter-specific requirements for persisting a
+// platform bot identity discovered from credentials.
+type SelfIdentityPolicy struct {
+	RefreshOnCredentialsChange       bool
+	RequireDiscoveryOnEnable         bool
+	RequiredSelfIdentityKey          string
+	DiscoveryErrorMessage            string
+	MissingIdentityMessage           string
+	DuplicateExternalIdentityMessage string
+}
+
+// SelfIdentityPolicyProvider lets adapters opt into stricter self-identity
+// discovery semantics than the default best-effort behavior.
+type SelfIdentityPolicyProvider interface {
+	SelfIdentityPolicy() SelfIdentityPolicy
+}
+
+// WebhookEndpointSetter updates the platform-side webhook endpoint.
+type WebhookEndpointSetter interface {
+	SetWebhookEndpoint(ctx context.Context, credentials map[string]any, endpoint string) error
+}
+
 // Receiver is an adapter capable of establishing a long-lived connection to receive messages.
 type Receiver interface {
 	Connect(ctx context.Context, cfg ChannelConfig, handler InboundHandler) (Connection, error)
+}
+
+// WebhookReceiver handles inbound HTTP webhook callbacks for webhook-style channels.
+// Implementations typically verify the request, parse the platform payload, and
+// forward resulting inbound messages to the provided handler.
+type WebhookReceiver interface {
+	HandleWebhook(ctx context.Context, cfg ChannelConfig, handler InboundHandler, r *http.Request, w http.ResponseWriter) error
 }
 
 // Connection represents an active, long-lived link to a channel platform.
@@ -186,8 +252,20 @@ func (c *BaseConnection) Stop(ctx context.Context) error {
 	if c.stop == nil {
 		return ErrStopNotSupported
 	}
+	if err := c.stop(ctx); err != nil {
+		return err
+	}
 	c.running.Store(false)
-	return c.stop(ctx)
+	return nil
+}
+
+// MarkStopped flags the connection as no longer running without
+// invoking its stop function. Adapters call this from internal
+// goroutines that have given up (terminal protocol error etc.) so
+// the manager's Running() check reflects reality and reconciliation
+// can act on it.
+func (c *BaseConnection) MarkStopped() {
+	c.running.Store(false)
 }
 
 // Running reports whether the connection is still active.

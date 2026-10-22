@@ -15,6 +15,6 @@
     "skipDefaultLibCheck": true,
     "skipLibCheck": true,
   },
-  "include": ["packages/**/*.ts", "packages/**/*/src/*", "packages/**/*/src/**/*"],
+  "include": ["packages/**/*.ts", "packages/**/*/src/*", "packages/**/*/src/**/*", "apps/**/*.ts", "apps/**/*/src/*", "apps/**/*/src/**/*"],
   "exclude": ["node_modules", "dist"]
 }

@@ -2,9 +2,10 @@ package channel
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"log/slog"
 	"testing"
+	"time"
 )
 
 // mockAdapter is used for inbound handleInbound tests.
@@ -13,8 +14,8 @@ type mockAdapter struct {
 	streamEvents []StreamEvent
 }
 
-func (m *mockAdapter) Type() ChannelType { return ChannelType("test") }
-func (m *mockAdapter) Descriptor() Descriptor {
+func (*mockAdapter) Type() ChannelType { return ChannelType("test") }
+func (*mockAdapter) Descriptor() Descriptor {
 	return Descriptor{
 		Type:        ChannelType("test"),
 		DisplayName: "Test",
@@ -25,12 +26,13 @@ func (m *mockAdapter) Descriptor() Descriptor {
 		},
 	}
 }
-func (m *mockAdapter) Send(ctx context.Context, cfg ChannelConfig, msg OutboundMessage) error {
-	m.sentMessages = append(m.sentMessages, msg)
+
+func (m *mockAdapter) Send(_ context.Context, _ ChannelConfig, msg PreparedOutboundMessage) error {
+	m.sentMessages = append(m.sentMessages, msg.LogicalMessage())
 	return nil
 }
 
-func (m *mockAdapter) OpenStream(ctx context.Context, cfg ChannelConfig, target string, opts StreamOptions) (OutboundStream, error) {
+func (m *mockAdapter) OpenStream(_ context.Context, _ ChannelConfig, _ string, _ StreamOptions) (PreparedOutboundStream, error) {
 	return &mockAdapterStream{adapter: m}, nil
 }
 
@@ -38,21 +40,22 @@ type mockAdapterStream struct {
 	adapter *mockAdapter
 }
 
-func (s *mockAdapterStream) Push(ctx context.Context, event StreamEvent) error {
+func (s *mockAdapterStream) Push(_ context.Context, event PreparedStreamEvent) error {
 	if s == nil || s.adapter == nil {
 		return nil
 	}
-	s.adapter.streamEvents = append(s.adapter.streamEvents, event)
-	if event.Type == StreamEventFinal && event.Final != nil && !event.Final.Message.IsEmpty() {
+	logical := event.LogicalEvent()
+	s.adapter.streamEvents = append(s.adapter.streamEvents, logical)
+	if logical.Type == StreamEventFinal && logical.Final != nil && !logical.Final.Message.IsEmpty() {
 		s.adapter.sentMessages = append(s.adapter.sentMessages, OutboundMessage{
 			Target:  "stream-target",
-			Message: event.Final.Message,
+			Message: logical.Final.Message,
 		})
 	}
 	return nil
 }
 
-func (s *mockAdapterStream) Close(ctx context.Context) error {
+func (*mockAdapterStream) Close(_ context.Context) error {
 	return nil
 }
 
@@ -73,14 +76,14 @@ func (f *fakeInboundProcessor) HandleInbound(ctx context.Context, cfg ChannelCon
 		return nil
 	}
 	if sender == nil {
-		return fmt.Errorf("sender missing")
+		return errors.New("sender missing")
 	}
 	return sender.Send(ctx, *f.resp)
 }
 
 type fakeInboundStreamProcessor struct{}
 
-func (f *fakeInboundStreamProcessor) HandleInbound(ctx context.Context, cfg ChannelConfig, msg InboundMessage, sender StreamReplySender) error {
+func (*fakeInboundStreamProcessor) HandleInbound(ctx context.Context, _ ChannelConfig, _ InboundMessage, sender StreamReplySender) error {
 	stream, err := sender.OpenStream(ctx, "stream-target", StreamOptions{})
 	if err != nil {
 		return err
@@ -100,6 +103,37 @@ func (f *fakeInboundStreamProcessor) HandleInbound(ctx context.Context, cfg Chan
 		return err
 	}
 	return stream.Close(ctx)
+}
+
+type inboundRequestContextKey struct{}
+
+type contextCapturingInboundProcessor struct {
+	contexts chan context.Context
+}
+
+func (p *contextCapturingInboundProcessor) HandleInbound(ctx context.Context, _ ChannelConfig, _ InboundMessage, _ StreamReplySender) error {
+	p.contexts <- ctx
+	return nil
+}
+
+func TestManagerInboundWorkersDoNotInheritFirstRequestContext(t *testing.T) {
+	processor := &contextCapturingInboundProcessor{contexts: make(chan context.Context, 1)}
+	m := NewManager(slog.New(slog.DiscardHandler), NewRegistry(), &fakeConfigStore{}, processor)
+	t.Cleanup(func() { _ = m.Shutdown(context.Background()) })
+
+	requestCtx := context.WithValue(context.Background(), inboundRequestContextKey{}, "first-request")
+	if err := m.HandleInbound(requestCtx, ChannelConfig{ID: "cfg-1"}, InboundMessage{}); err != nil {
+		t.Fatalf("HandleInbound: %v", err)
+	}
+
+	select {
+	case workerCtx := <-processor.contexts:
+		if got := workerCtx.Value(inboundRequestContextKey{}); got != nil {
+			t.Fatalf("worker inherited first request context value: %v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for inbound worker")
+	}
 }
 
 func TestManager_handleInbound(t *testing.T) {
@@ -127,7 +161,7 @@ func TestManager_handleInbound(t *testing.T) {
 			ReplyTarget: "target-id",
 			Conversation: Conversation{
 				ID:   "chat-1",
-				Type: "p2p",
+				Type: ConversationTypePrivate,
 			},
 		}
 
@@ -198,7 +232,7 @@ func TestManager_handleInbound(t *testing.T) {
 			ReplyTarget: "stream-target",
 			Conversation: Conversation{
 				ID:   "chat-1",
-				Type: "p2p",
+				Type: ConversationTypePrivate,
 			},
 		}
 		if err := m.handleInbound(context.Background(), cfg, msg); err != nil {

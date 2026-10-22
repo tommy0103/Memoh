@@ -1,0 +1,399 @@
+package tools
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"strings"
+
+	sdk "github.com/felinics/twilight/sdk"
+
+	"github.com/felinics/memoh/internal/agent/sessionmode"
+	"github.com/felinics/memoh/internal/agent/toolexec"
+	"github.com/felinics/memoh/internal/messaging"
+)
+
+type MessageProvider struct {
+	exec *messaging.Executor
+}
+
+func NewMessageProvider(log *slog.Logger, sender messaging.Sender, reactor messaging.Reactor, resolver messaging.ChannelTypeResolver, assetResolver messaging.AssetResolver) *MessageProvider {
+	if log == nil {
+		log = slog.Default()
+	}
+	exec := &messaging.Executor{
+		Sender:        sender,
+		Reactor:       reactor,
+		Resolver:      resolver,
+		AssetResolver: assetResolver,
+		Logger:        log.With(slog.String("tool", "message")),
+	}
+	if promoter, ok := sender.(messaging.AttachmentPromoter); ok {
+		exec.Promoter = promoter
+	}
+	return &MessageProvider{exec: exec}
+}
+
+func (*MessageProvider) Usage(_ context.Context, session SessionContext, available AvailableTools) string {
+	var parts []string
+	if sendRef, ok := available.Ref(ToolSend()); ok {
+		switch session.SessionType {
+		case sessionmode.Discuss:
+			parts = append(parts, "Use "+sendRef+" to speak in the observed conversation; if you do not call it, you stay silent.")
+			parts = append(parts, "When you are addressed with a task that needs several tool steps or noticeable time, first call "+sendRef+" with one short acknowledgement, then send progress only when you hit a blocker, change direction, or finish a meaningful stage, and end with the result. Do not narrate each tool call, repeat earlier messages, or add a preamble to simple answers.")
+		case sessionmode.Schedule:
+			parts = append(parts, "Use "+sendRef+" only when the background task needs to notify a person or channel; specify `platform` and `target`.")
+		default:
+			if session.CanOmitMessagingTarget() {
+				parts = append(parts, sendRef+": Send only to another conversation; current-conversation replies, including images and files, must be ordinary assistant Markdown.")
+			} else {
+				parts = append(parts, sendRef+": Send a message, file, or attachment. Specify `platform` and `target` in this session.")
+			}
+		}
+		parts = append(parts, "Reference images as ![description](/data/path.png) and files as [name](/data/path) in Markdown text. There is no attachments parameter. If the result reports partial=true, prose was delivered but some media could not be shared; do not resend the whole message.")
+		parts = append(parts, "Use `message.parts` only when a messaging tool needs precise structured output such as link/code_block/mention/heading/blockquote/list_item parts or inline styles; keep ordinary prose and Markdown in `text`.")
+		if messagingSessionSupportsMarkdownMath(session) {
+			parts = append(parts, "For Telegram targets, write math in Markdown text as `\\(...\\)` for inline LaTeX and `\\[...\\]` for display LaTeX; do not use `$` or `$$` as math delimiters, write prices as plain text, and do not wrap formulas in code blocks unless you want to show source code.")
+		}
+	}
+	if reactRef, ok := available.Ref(ToolReact()); ok {
+		if session.CanOmitMessagingTarget() {
+			parts = append(parts, reactRef+": Add or remove an emoji reaction on a message. Omit `target` to react in the current conversation.")
+		} else {
+			parts = append(parts, reactRef+": Add or remove an emoji reaction on a message. Specify `platform` and `target` in this session.")
+		}
+	}
+	return usageSection("Messaging", parts)
+}
+
+func (p *MessageProvider) Tools(_ context.Context, session SessionContext) ([]toolexec.Tool, error) {
+	if session.IsSubagent {
+		return nil, nil
+	}
+	var tools []toolexec.Tool
+	sess := session
+	if p.exec.CanSend() {
+		sendDescription, sendPlatformDescription, sendTargetDescription, sendRequired := sendToolPromptMetadata(session)
+		tools = append(tools, toolexec.Tool{
+			Name:        ToolSend().String(),
+			Description: sendDescription,
+			Parameters: toolexec.SchemaFromValue(map[string]any{
+				"type":                 "object",
+				"additionalProperties": false,
+				"properties": map[string]any{
+					"bot_id":   map[string]any{"type": "string", "description": "Bot ID, optional and defaults to current bot"},
+					"platform": map[string]any{"type": "string", "description": sendPlatformDescription},
+					"target":   map[string]any{"type": "string", "description": sendTargetDescription},
+					"text":     map[string]any{"type": "string", "description": "Message text shortcut when message object is omitted"},
+					"reply_to": map[string]any{"type": "string", "description": "Message ID to reply to. The reply will reference this message on the platform."},
+					"message":  sendMessageObjectSchema(),
+				},
+				"required": sendRequired,
+			}),
+			Execute: func(ctx *toolexec.ToolExecContext, input sdk.ToolArguments) (sdk.ToolOutput, error) {
+				return toolexec.OutputPair(p.execSend(ctx.Context, sess, ctx.ToolCallID, inputAsMap(input)))
+			},
+		})
+	}
+	if p.exec.CanReact() {
+		reactDescription, reactPlatformDescription, reactTargetDescription, reactRequired := reactToolPromptMetadata(session)
+		tools = append(tools, toolexec.Tool{
+			Name:        ToolReact().String(),
+			Description: reactDescription,
+			Parameters: toolexec.SchemaFromValue(map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"bot_id":     map[string]any{"type": "string", "description": "Bot ID, optional and defaults to current bot"},
+					"platform":   map[string]any{"type": "string", "description": reactPlatformDescription},
+					"target":     map[string]any{"type": "string", "description": reactTargetDescription},
+					"message_id": map[string]any{"type": "string", "description": "The message ID to react to"},
+					"emoji":      map[string]any{"type": "string", "description": "Emoji to react with (e.g. 👍, ❤️). Required when adding a reaction."},
+					"remove":     map[string]any{"type": "boolean", "description": "If true, remove the reaction instead of adding it. Default false."},
+				},
+				"required": reactRequired,
+			}),
+			Execute: func(ctx *toolexec.ToolExecContext, input sdk.ToolArguments) (sdk.ToolOutput, error) {
+				return toolexec.OutputPair(p.execReact(ctx.Context, sess, inputAsMap(input)))
+			},
+		})
+	}
+	return tools, nil
+}
+
+func sendMessageObjectSchema() map[string]any {
+	return map[string]any{
+		"type":                 "object",
+		"description":          "Structured message payload. Use text for ordinary messages; use parts only when you need explicit links, code blocks, mentions, emoji, headings, quotes, list items, or inline styles.",
+		"additionalProperties": false,
+		"properties": map[string]any{
+			"format": map[string]any{
+				"type":        "string",
+				"description": "Rendering hint for text. Use markdown for ordinary Markdown text; use rich only with parts.",
+				"enum":        []any{"plain", "markdown", "rich"},
+			},
+			"text": map[string]any{
+				"type":        "string",
+				"description": "Message body. Prefer this for ordinary prose and Markdown replies.",
+			},
+			"parts": map[string]any{
+				"type":        "array",
+				"description": "Structured rich body. Use only for explicit link/code_block/mention/emoji/heading/blockquote/list_item parts or styled spans.",
+				"items":       sendMessagePartSchema(),
+			},
+			"actions": map[string]any{
+				"type":        "array",
+				"description": "Optional action buttons. URL actions render only on channels with button support.",
+				"items": map[string]any{
+					"type":                 "object",
+					"additionalProperties": false,
+					"required":             []string{"label", "url"},
+					"properties": map[string]any{
+						"type":  map[string]any{"type": "string"},
+						"label": map[string]any{"type": "string"},
+						"url":   map[string]any{"type": "string"},
+						"row":   map[string]any{"type": "integer"},
+					},
+				},
+			},
+			"reply": map[string]any{
+				"type":                 "object",
+				"description":          "Reply reference; normally use the top-level reply_to shortcut instead.",
+				"additionalProperties": false,
+				"required":             []string{"message_id"},
+				"properties": map[string]any{
+					"message_id": map[string]any{"type": "string"},
+				},
+			},
+		},
+	}
+}
+
+func sendMessagePartSchema() map[string]any {
+	return map[string]any{
+		"type":                 "object",
+		"additionalProperties": false,
+		"required":             []any{"type"},
+		"properties": map[string]any{
+			"type": map[string]any{
+				"type": "string",
+				"enum": []any{"text", "link", "code_block", "mention", "emoji", "heading", "blockquote", "list_item"},
+			},
+			"text": map[string]any{
+				"type":        "string",
+				"description": "Visible text for text/code_block/mention/emoji/heading/blockquote/list_item parts. Optional label for link parts; required for mention parts.",
+			},
+			"url": map[string]any{
+				"type":        "string",
+				"description": "URL for link parts.",
+			},
+			"styles": map[string]any{
+				"type":        "array",
+				"description": "Inline styles for text-like parts.",
+				"items": map[string]any{
+					"type": "string",
+					"enum": []any{"bold", "italic", "strikethrough", "code", "underline", "spoiler"},
+				},
+			},
+			"language": map[string]any{
+				"type":        "string",
+				"description": "Language hint for code_block parts.",
+			},
+			"channel_identity_id": map[string]any{
+				"type":        "string",
+				"description": "Platform identity ID for mention parts when known.",
+			},
+			"emoji": map[string]any{
+				"type":        "string",
+				"description": "Emoji fallback for emoji parts.",
+			},
+		},
+	}
+}
+
+func messagingSessionSupportsMarkdownMath(session SessionContext) bool {
+	return strings.EqualFold(strings.TrimSpace(session.CurrentPlatform), "telegram")
+}
+
+// PlatformRendersMarkdownMath reports whether a platform's client renders
+// Markdown math (LaTeX delimiters), so replies there should prefer \(...\) /
+// \[...\] over bare $...$ which collides with currency text.
+func PlatformRendersMarkdownMath(platform string) bool {
+	switch strings.ToLower(strings.TrimSpace(platform)) {
+	case "web", "local", "telegram":
+		return true
+	}
+	return false
+}
+
+func sendToolPromptMetadata(session SessionContext) (description string, platformDescription string, targetDescription string, required []string) {
+	if session.SessionType == sessionmode.Discuss {
+		if session.CanOmitMessagingTarget() {
+			return "Send a message into the observed conversation. When target is omitted, sends to the observed conversation. When target is specified, sends to that channel/person.",
+				"Channel platform name. Defaults to current session platform.",
+				"Channel target (chat/group/thread ID). Optional — omit to send in the observed conversation.",
+				[]string{}
+		}
+		return "Send a message into the observed conversation or another channel/person. Specify platform and target in this session.",
+			"Channel platform name. Required in this session.",
+			"Channel target (chat/group/thread ID). Required in this session.",
+			[]string{"platform", "target"}
+	}
+	if session.SessionType == sessionmode.Schedule {
+		return "Send a notification. Reference images and files with Markdown in text. Specify platform and target.", "Channel platform name. Required.", "Channel target. Required.", []string{"platform", "target"}
+	}
+	return "Send to another conversation. In chat mode, never send to the current conversation: reply directly instead. Reference images with ![description](/data/path.png) and files with [name](/data/path) in text. Specify platform and target.",
+		"Channel platform name. Required in this session.",
+		"Channel target (chat/group/thread ID). Required in this session.",
+		[]string{"platform", "target"}
+}
+
+func reactToolPromptMetadata(session SessionContext) (description string, platformDescription string, targetDescription string, required []string) {
+	if session.CanOmitMessagingTarget() {
+		return "Add or remove an emoji reaction on a message. When target/platform are omitted, reacts in the current conversation.",
+			"Channel platform name. Defaults to current session platform.",
+			"Channel target (chat/group ID). Defaults to current session reply target.",
+			[]string{"message_id"}
+	}
+	return "Add or remove an emoji reaction on a message. Specify platform and target in this session.",
+		"Channel platform name. Required in this session.",
+		"Channel target (chat/group ID). Required in this session.",
+		[]string{"message_id", "platform", "target"}
+}
+
+func (p *MessageProvider) execSend(ctx context.Context, session SessionContext, toolCallID string, args map[string]any) (any, error) {
+	if _, ok := args["attachments"]; ok {
+		return nil, errors.New("attachments is no longer supported; reference images and files in Markdown text")
+	}
+	if msg, ok := args["message"].(map[string]any); ok {
+		if _, exists := msg["attachments"]; exists {
+			return nil, errors.New("message.attachments is no longer supported; reference images and files in Markdown text")
+		}
+	}
+	if session.SessionType == sessionmode.Chat && (strings.TrimSpace(StringArg(args, "platform")) == "" || strings.TrimSpace(StringArg(args, "target")) == "") {
+		return nil, errors.New("platform and target are required; reply directly to the current conversation")
+	}
+
+	if session.SessionType == sessionmode.Discuss {
+		sendResult, err := p.exec.SendDirect(ctx, toMessagingSession(session), "", args)
+		if err != nil {
+			return nil, err
+		}
+		resp := map[string]any{
+			"ok": true, "bot_id": sendResult.BotID, "platform": sendResult.Platform, "target": sendResult.Target,
+			"delivered": messageDeliveryLabel(session, sendResult.Platform, sendResult.Target),
+			"partial":   sendResult.Partial,
+		}
+		if sendResult.MessageID != "" {
+			resp["message_id"] = sendResult.MessageID
+		}
+		return resp, nil
+	}
+	result, err := p.exec.Send(ctx, toMessagingSession(session), args)
+	if err != nil {
+		return nil, err
+	}
+	if result.Local && session.Emitter != nil {
+		atts := channelAttachmentsToToolAttachments(result.LocalAttachments)
+		if len(atts) > 0 {
+			session.Emitter(ToolStreamEvent{
+				Type:        StreamEventAttachment,
+				ToolCallID:  toolCallID,
+				Attachments: atts,
+			})
+		}
+		resp := map[string]any{
+			"ok":          true,
+			"delivered":   "current_conversation",
+			"attachments": len(atts),
+		}
+		if result.LocalTextOmitted {
+			resp["text_delivered"] = false
+			resp["note"] = "attachments were delivered to the current conversation, but message text is never sent this way; include it in your assistant reply text instead"
+		}
+		if result.MessageID != "" {
+			resp["message_id"] = result.MessageID
+		}
+		return resp, nil
+	}
+	if result.Local {
+		sendResult, err := p.exec.SendDirect(ctx, toMessagingSession(session), result.Target, args)
+		if err != nil {
+			return nil, err
+		}
+		resp := map[string]any{
+			"ok":        true,
+			"bot_id":    sendResult.BotID,
+			"platform":  sendResult.Platform,
+			"target":    sendResult.Target,
+			"delivered": messageDeliveryLabel(session, sendResult.Platform, sendResult.Target),
+			"partial":   sendResult.Partial,
+		}
+		if sendResult.MessageID != "" {
+			resp["message_id"] = sendResult.MessageID
+		}
+		return resp, nil
+	}
+	resp := map[string]any{
+		"ok":        true,
+		"bot_id":    result.BotID,
+		"platform":  result.Platform,
+		"target":    result.Target,
+		"delivered": messageDeliveryLabel(session, result.Platform, result.Target),
+		"partial":   result.Partial,
+	}
+	if result.MessageID != "" {
+		resp["message_id"] = result.MessageID
+	}
+	return resp, nil
+}
+
+func messageDeliveryLabel(session SessionContext, platform, target string) string {
+	if session.IsSameConversation(platform, target) {
+		return "current_conversation"
+	}
+	return "target"
+}
+
+func channelAttachmentsToToolAttachments(atts []messaging.Attachment) []Attachment {
+	if len(atts) == 0 {
+		return nil
+	}
+	result := make([]Attachment, 0, len(atts))
+	for _, a := range atts {
+		result = append(result, toolAttachmentFromChannelAttachment(a))
+	}
+	return result
+}
+
+func (p *MessageProvider) execReact(ctx context.Context, session SessionContext, args map[string]any) (any, error) {
+	result, err := p.exec.React(ctx, toMessagingSession(session), args)
+	if err != nil {
+		return nil, err
+	}
+	if result.Local && session.Emitter != nil {
+		session.Emitter(ToolStreamEvent{
+			Type: StreamEventReaction,
+			Reactions: []Reaction{{
+				Emoji:     result.Emoji,
+				MessageID: result.MessageID,
+				Remove:    result.Remove,
+			}},
+		})
+	}
+	return map[string]any{
+		"ok": true, "bot_id": result.BotID, "platform": result.Platform,
+		"target": result.Target, "message_id": result.MessageID, "emoji": result.Emoji, "action": result.Action,
+	}, nil
+}
+
+func toMessagingSession(s SessionContext) messaging.SessionContext {
+	return messaging.SessionContext{
+		BotID:                     s.BotID,
+		ChatID:                    s.ChatID,
+		CanOmitTarget:             s.CanOmitMessagingTarget() || s.SessionType == sessionmode.Discuss,
+		AllowLocalShortcut:        s.CanUseLocalMessagingShortcut(),
+		RejectCurrentConversation: s.SessionType == sessionmode.Chat,
+		CurrentPlatform:           s.CurrentPlatform,
+		ReplyTarget:               s.ReplyTarget,
+	}
+}

@@ -6,13 +6,17 @@ package handlers
 import (
 	"log/slog"
 	"net/http"
-	"os"
 	"sync"
 
 	"github.com/labstack/echo/v4"
+	"github.com/swaggo/swag"
+
+	"github.com/felinics/memoh/internal/errs"
+	// Register the generated swagger document for swag.ReadDoc.
+	_ "github.com/felinics/memoh/spec"
 )
 
-//go:generate go run github.com/swaggo/swag/cmd/swag@latest init -g swagger.go -o ../../spec --parseDependency --parseInternal
+//go:generate go tool swag init -g swagger.go -o ../../spec --parseDependency --parseInternal
 
 var (
 	swaggerSpec []byte
@@ -34,17 +38,19 @@ func (h *SwaggerHandler) Register(e *echo.Echo) {
 	e.GET("api/docs/", h.UI)
 }
 
-func (h *SwaggerHandler) Spec(c echo.Context) error {
+func (*SwaggerHandler) Spec(c echo.Context) error {
 	swaggerOnce.Do(func() {
-		swaggerSpec, swaggerErr = os.ReadFile("spec/swagger.json")
+		var doc string
+		doc, swaggerErr = swag.ReadDoc()
+		swaggerSpec = []byte(doc)
 	})
 	if swaggerErr != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, swaggerErr.Error())
+		return errs.Wrap(swaggerErr, "read swagger doc")
 	}
 	return c.Blob(http.StatusOK, "application/json", swaggerSpec)
 }
 
-func (h *SwaggerHandler) UI(c echo.Context) error {
+func (*SwaggerHandler) UI(c echo.Context) error {
 	return c.HTML(http.StatusOK, swaggerUIHTML)
 }
 

@@ -5,7 +5,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/memohai/memoh/internal/db"
+	"github.com/felinics/memoh/internal/db"
 )
 
 func TestDecodeConfigMap(t *testing.T) {
@@ -65,4 +65,3 @@ func TestBindingCriteriaFromIdentity(t *testing.T) {
 		t.Fatalf("unexpected username: %s", criteria.Attribute("username"))
 	}
 }
-

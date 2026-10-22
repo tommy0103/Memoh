@@ -39,6 +39,32 @@ type Conversation struct {
 	Metadata map[string]any
 }
 
+const (
+	ConversationTypePrivate = "private"
+	ConversationTypeGroup   = "group"
+	ConversationTypeThread  = "thread"
+)
+
+// NormalizeConversationType normalizes conversation type values within the
+// channel abstraction domain: private/group/thread.
+func NormalizeConversationType(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "p2p", "direct", ConversationTypePrivate:
+		return ConversationTypePrivate
+	case ConversationTypeThread:
+		return ConversationTypeThread
+	case ConversationTypeGroup:
+		return ConversationTypeGroup
+	default:
+		return ConversationTypeGroup
+	}
+}
+
+// IsPrivateConversationType reports whether the conversation is private.
+func IsPrivateConversationType(raw string) bool {
+	return NormalizeConversationType(raw) == ConversationTypePrivate
+}
+
 // InboundMessage is a message received from an external channel.
 type InboundMessage struct {
 	Channel      ChannelType
@@ -70,8 +96,7 @@ func (m InboundMessage) RoutingKey() string {
 // For group chats, the sender ID is appended to provide per-user context.
 func GenerateRoutingKey(platform, botID, conversationID, conversationType, senderID string) string {
 	parts := []string{platform, botID, conversationID}
-	ct := strings.ToLower(strings.TrimSpace(conversationType))
-	if ct != "" && ct != "p2p" && ct != "private" {
+	if !IsPrivateConversationType(conversationType) {
 		senderID = strings.TrimSpace(senderID)
 		if senderID != "" {
 			parts = append(parts, senderID)
@@ -101,9 +126,20 @@ const (
 	StreamEventAttachment          StreamEventType = "attachment"
 	StreamEventAgentStart          StreamEventType = "agent_start"
 	StreamEventAgentEnd            StreamEventType = "agent_end"
+	StreamEventReaction            StreamEventType = "reaction"
+	StreamEventSpeech              StreamEventType = "speech"
 	StreamEventProcessingStarted   StreamEventType = "processing_started"
 	StreamEventProcessingCompleted StreamEventType = "processing_completed"
-	StreamEventProcessingFailed    StreamEventType = "processing_failed"
+	// StreamEventReset discards the reply text streamed so far: the agent is
+	// retrying and regenerates it from scratch, so the next delta starts a
+	// fresh reply instead of extending the failed attempt's partial output.
+	StreamEventReset StreamEventType = "reset"
+	// StreamEventSegmentEnd marks that the current assistant text segment
+	// ended at a tool call hidden from this channel. Adapters commit the
+	// buffered text as its own message and reset per-message streaming
+	// state, without rendering any tool-call UI, so the text that follows
+	// the tool call starts a fresh message.
+	StreamEventSegmentEnd StreamEventType = "segment_end"
 )
 
 // StreamStatus indicates the lifecycle state of a streaming reply.
@@ -122,10 +158,14 @@ type StreamFinalizePayload struct {
 
 // StreamToolCall carries tool invocation data for tool_call_start / tool_call_end events.
 type StreamToolCall struct {
-	Name   string `json:"name"`
-	CallID string `json:"call_id,omitempty"`
-	Input  any    `json:"input,omitempty"`
-	Result any    `json:"result,omitempty"`
+	Name       string   `json:"name"`
+	CallID     string   `json:"call_id,omitempty"`
+	Locale     string   `json:"locale,omitempty"`
+	Input      any      `json:"input,omitempty"`
+	Result     any      `json:"result,omitempty"`
+	ApprovalID string   `json:"approval_id,omitempty"`
+	ShortID    int      `json:"short_id,omitempty"`
+	Actions    []Action `json:"actions,omitempty"`
 }
 
 // StreamPhase labels a processing stage within a stream (e.g., reasoning, text).
@@ -137,16 +177,26 @@ const (
 )
 
 // StreamEvent represents a unified stream event routed through the channel layer.
+// ErrorCode names the catalog code Error was rendered from: with a code, Error
+// is complete user-facing copy; without one it is a bare error text.
 type StreamEvent struct {
 	Type        StreamEventType        `json:"type"`
 	Status      StreamStatus           `json:"status,omitempty"`
 	Delta       string                 `json:"delta,omitempty"`
 	Final       *StreamFinalizePayload `json:"final,omitempty"`
 	Error       string                 `json:"error,omitempty"`
+	ErrorCode   string                 `json:"error_code,omitempty"`
 	ToolCall    *StreamToolCall        `json:"tool_call,omitempty"`
 	Phase       StreamPhase            `json:"phase,omitempty"`
 	Attachments []Attachment           `json:"attachments,omitempty"`
+	Reactions   []ReactRequest         `json:"reactions,omitempty"`
+	Speeches    []SpeechRequest        `json:"speeches,omitempty"`
 	Metadata    map[string]any         `json:"metadata,omitempty"`
+}
+
+// SpeechRequest carries text-to-speech synthesis text from a speech_delta stream event.
+type SpeechRequest struct {
+	Text string `json:"text"`
 }
 
 // StreamOptions configures how an outbound stream is initialized.
@@ -169,11 +219,14 @@ const (
 type MessagePartType string
 
 const (
-	MessagePartText      MessagePartType = "text"
-	MessagePartLink      MessagePartType = "link"
-	MessagePartCodeBlock MessagePartType = "code_block"
-	MessagePartMention   MessagePartType = "mention"
-	MessagePartEmoji     MessagePartType = "emoji"
+	MessagePartText       MessagePartType = "text"
+	MessagePartLink       MessagePartType = "link"
+	MessagePartCodeBlock  MessagePartType = "code_block"
+	MessagePartMention    MessagePartType = "mention"
+	MessagePartEmoji      MessagePartType = "emoji"
+	MessagePartHeading    MessagePartType = "heading"
+	MessagePartBlockquote MessagePartType = "blockquote"
+	MessagePartListItem   MessagePartType = "list_item"
 )
 
 // MessageTextStyle describes inline formatting for a text part.
@@ -184,6 +237,8 @@ const (
 	MessageStyleItalic        MessageTextStyle = "italic"
 	MessageStyleStrikethrough MessageTextStyle = "strikethrough"
 	MessageStyleCode          MessageTextStyle = "code"
+	MessageStyleUnderline     MessageTextStyle = "underline"
+	MessageStyleSpoiler       MessageTextStyle = "spoiler"
 )
 
 // MessagePart is a single element within a rich-text message.
@@ -213,10 +268,11 @@ const (
 // Attachment represents a binary file attached to a message.
 type Attachment struct {
 	Type           AttachmentType `json:"type"`
-	URL            string         `json:"url,omitempty"`
+	URL            string         `json:"url,omitempty"`  // HTTP(S) or data URL
+	Path           string         `json:"path,omitempty"` // workspace-local filesystem path
 	PlatformKey    string         `json:"platform_key,omitempty"`
 	SourcePlatform string         `json:"source_platform,omitempty"`
-	AssetID        string         `json:"asset_id,omitempty"`
+	ContentHash    string         `json:"content_hash,omitempty"`
 	Base64         string         `json:"base64,omitempty"` // data URL for agent delivery
 	Name           string         `json:"name,omitempty"`
 	Size           int64          `json:"size,omitempty"`
@@ -230,15 +286,18 @@ type Attachment struct {
 }
 
 // Reference returns the strongest available attachment reference.
-// URL is preferred for cross-platform portability, then platform key.
+// URL is preferred for cross-platform portability, then local Path, then platform key.
 func (a Attachment) Reference() string {
 	if strings.TrimSpace(a.URL) != "" {
 		return strings.TrimSpace(a.URL)
 	}
+	if strings.TrimSpace(a.Path) != "" {
+		return strings.TrimSpace(a.Path)
+	}
 	return strings.TrimSpace(a.PlatformKey)
 }
 
-// HasReference reports whether URL or platform key is available.
+// HasReference reports whether URL, Path, or platform key is available.
 func (a Attachment) HasReference() bool {
 	return a.Reference() != ""
 }
@@ -249,6 +308,11 @@ type Action struct {
 	Label string `json:"label,omitempty"`
 	Value string `json:"value,omitempty"`
 	URL   string `json:"url,omitempty"`
+	// Row groups buttons into keyboard rows for renderers that support grids
+	// (e.g. Telegram inline keyboards). Buttons sharing a Row render together;
+	// rows appear in ascending numeric order. Renderers without grid support
+	// ignore this field. 0 is the default (single row, prior behavior).
+	Row int `json:"row,omitempty"`
 }
 
 // ThreadRef references a conversation thread by ID.
@@ -258,11 +322,32 @@ type ThreadRef struct {
 
 // ReplyRef points to a message being replied to.
 type ReplyRef struct {
-	Target    string `json:"target,omitempty"`
-	MessageID string `json:"message_id,omitempty"`
+	Target           string       `json:"target,omitempty"`
+	MessageID        string       `json:"message_id,omitempty"`
+	Sender           string       `json:"sender,omitempty"`
+	Preview          string       `json:"preview,omitempty"`
+	Attachments      []Attachment `json:"attachments,omitempty"`
+	AttachmentsKnown bool         `json:"attachments_known,omitempty"`
+}
+
+// ForwardRef describes the structured origin of a forwarded message.
+type ForwardRef struct {
+	MessageID          string `json:"message_id,omitempty"`
+	FromUserID         string `json:"from_user_id,omitempty"`
+	FromConversationID string `json:"from_conversation_id,omitempty"`
+	Sender             string `json:"sender,omitempty"`
+	Date               int64  `json:"date,omitempty"`
+	AttachmentsKnown   bool   `json:"attachments_known,omitempty"`
 }
 
 // Message is the unified message structure used across all channels.
+//
+// Thread routing should flow through Conversation.ThreadID at the envelope
+// level. Thread remains for API compatibility with existing callers that still
+// attach thread scope to the message body. Forward is populated inbound
+// (Telegram, Misskey) and persisted to history but no adapter Send currently
+// honors it on outbound — explicitly forwarding an existing message requires a
+// dedicated future feature.
 type Message struct {
 	ID          string         `json:"id,omitempty"`
 	Format      MessageFormat  `json:"format,omitempty"`
@@ -272,6 +357,7 @@ type Message struct {
 	Actions     []Action       `json:"actions,omitempty"`
 	Thread      *ThreadRef     `json:"thread,omitempty"`
 	Reply       *ReplyRef      `json:"reply,omitempty"`
+	Forward     *ForwardRef    `json:"forward,omitempty"`
 	Metadata    map[string]any `json:"metadata,omitempty"`
 }
 
@@ -286,31 +372,16 @@ func (m Message) IsEmpty() bool {
 // PlainText extracts the plain text representation of the message.
 func (m Message) PlainText() string {
 	if strings.TrimSpace(m.Text) != "" {
-		return strings.TrimSpace(m.Text)
+		text := strings.TrimSpace(m.Text)
+		if len(m.Parts) == 0 {
+			return text
+		}
+		return appendTextSection(text, RenderPartsAsPlain(m.Parts))
 	}
 	if len(m.Parts) == 0 {
 		return ""
 	}
-	lines := make([]string, 0, len(m.Parts))
-	for _, part := range m.Parts {
-		switch part.Type {
-		case MessagePartText, MessagePartLink, MessagePartCodeBlock, MessagePartMention, MessagePartEmoji:
-			value := strings.TrimSpace(part.Text)
-			if value == "" && part.Type == MessagePartLink {
-				value = strings.TrimSpace(part.URL)
-			}
-			if value == "" && part.Type == MessagePartEmoji {
-				value = strings.TrimSpace(part.Emoji)
-			}
-			if value == "" {
-				continue
-			}
-			lines = append(lines, value)
-		default:
-			continue
-		}
-	}
-	return strings.Join(lines, "\n")
+	return strings.TrimSpace(RenderPartsAsPlain(m.Parts))
 }
 
 // BindingCriteria specifies conditions for matching a user-channel binding.
@@ -339,6 +410,7 @@ func BindingCriteriaFromIdentity(identity Identity) BindingCriteria {
 // Disabled: true means the channel is stopped (not connected); false means enabled.
 type ChannelConfig struct {
 	ID               string         `json:"id"`
+	TeamID           string         `json:"team_id"`
 	BotID            string         `json:"bot_id"`
 	ChannelType      ChannelType    `json:"channel_type"`
 	Credentials      map[string]any `json:"credentials"`
@@ -384,6 +456,8 @@ type UpdateChannelStatusRequest struct {
 
 // SendRequest is the input for sending an outbound message through a channel.
 type SendRequest struct {
+	// ExcludedTarget is checked after platform target resolution, before publication.
+	ExcludedTarget    string  `json:"excluded_target,omitempty"`
 	Target            string  `json:"target,omitempty"`
 	ChannelIdentityID string  `json:"channel_identity_id,omitempty"`
 	Message           Message `json:"message"`
@@ -396,3 +470,20 @@ type ReactRequest struct {
 	Emoji     string `json:"emoji"`
 	Remove    bool   `json:"remove,omitempty"`
 }
+
+// Well-known ChannelType values for platforms with special handling in the core channel package.
+// Adapter packages define their own identical constant as their package-local Type.
+const (
+	ChannelTypeTelegram ChannelType = "telegram"
+	ChannelTypeFeishu   ChannelType = "feishu"
+	ChannelTypeDingtalk ChannelType = "dingtalk"
+	ChannelTypeMatrix   ChannelType = "matrix"
+	ChannelTypeDiscord  ChannelType = "discord"
+	ChannelTypeQQ       ChannelType = "qq"
+	ChannelTypeWecom    ChannelType = "wecom"
+	ChannelTypeWeixin   ChannelType = "weixin"
+	ChannelTypeWeChatOA ChannelType = "wechatoa"
+	ChannelTypeLocal    ChannelType = "local"
+	ChannelTypeSlack    ChannelType = "slack"
+	ChannelTypeLine     ChannelType = "line"
+)

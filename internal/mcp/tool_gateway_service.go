@@ -2,12 +2,15 @@ package mcp
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
-	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/felinics/memoh/internal/toolcontext"
 )
 
 const (
@@ -19,26 +22,29 @@ type cachedToolRegistry struct {
 	registry  *ToolRegistry
 }
 
-// ToolGatewayService federates tools from executors and sources.
+// ToolGatewayService federates tools from gateway sources, including external
+// MCP connections and selected native Memoh tools exposed to ACP runtimes.
 type ToolGatewayService struct {
-	logger    *slog.Logger
-	executors []ToolExecutor
-	sources   []ToolSource
-	cacheTTL  time.Duration
+	logger   *slog.Logger
+	sources  []ToolSource
+	cacheTTL time.Duration
+	limit    ToolOutputLimit
 
 	mu    sync.Mutex
 	cache map[string]cachedToolRegistry
 }
 
-func NewToolGatewayService(log *slog.Logger, executors []ToolExecutor, sources []ToolSource) *ToolGatewayService {
+type ToolGatewayOption func(*ToolGatewayService)
+
+func WithToolOutputLimit(limit ToolOutputLimit) ToolGatewayOption {
+	return func(s *ToolGatewayService) {
+		s.limit = limit
+	}
+}
+
+func NewToolGatewayService(log *slog.Logger, sources []ToolSource, opts ...ToolGatewayOption) *ToolGatewayService {
 	if log == nil {
 		log = slog.Default()
-	}
-	filteredExecutors := make([]ToolExecutor, 0, len(executors))
-	for _, executor := range executors {
-		if executor != nil {
-			filteredExecutors = append(filteredExecutors, executor)
-		}
 	}
 	filteredSources := make([]ToolSource, 0, len(sources))
 	for _, source := range sources {
@@ -46,28 +52,18 @@ func NewToolGatewayService(log *slog.Logger, executors []ToolExecutor, sources [
 			filteredSources = append(filteredSources, source)
 		}
 	}
-	return &ToolGatewayService{
-		logger:    log.With(slog.String("service", "tool_gateway")),
-		executors: filteredExecutors,
-		sources:   filteredSources,
-		cacheTTL:  defaultToolRegistryCacheTTL,
-		cache:     map[string]cachedToolRegistry{},
+	svc := &ToolGatewayService{
+		logger:   log.With(slog.String("service", "tool_gateway")),
+		sources:  filteredSources,
+		cacheTTL: defaultToolRegistryCacheTTL,
+		cache:    map[string]cachedToolRegistry{},
 	}
-}
-
-func (s *ToolGatewayService) InitializeResult() map[string]any {
-	return map[string]any{
-		"protocolVersion": "2025-06-18",
-		"capabilities": map[string]any{
-			"tools": map[string]any{
-				"listChanged": false,
-			},
-		},
-		"serverInfo": map[string]any{
-			"name":    "memoh-tools-gateway",
-			"version": "1.0.0",
-		},
+	for _, opt := range opts {
+		if opt != nil {
+			opt(svc)
+		}
 	}
+	return svc
 }
 
 func (s *ToolGatewayService) ListTools(ctx context.Context, session ToolSessionContext) ([]ToolDescriptor, error) {
@@ -78,26 +74,48 @@ func (s *ToolGatewayService) ListTools(ctx context.Context, session ToolSessionC
 	return registry.List(), nil
 }
 
+func (s *ToolGatewayService) LookupTool(ctx context.Context, session ToolSessionContext, toolName string) (ToolDescriptor, bool, error) {
+	toolName = strings.TrimSpace(toolName)
+	if toolName == "" {
+		return ToolDescriptor{}, false, nil
+	}
+	registry, err := s.getRegistry(ctx, session, false)
+	if err != nil {
+		return ToolDescriptor{}, false, err
+	}
+	if _, desc, ok := registry.Lookup(toolName); ok {
+		return desc, true, nil
+	}
+	registry, err = s.getRegistry(ctx, session, true)
+	if err != nil {
+		return ToolDescriptor{}, false, err
+	}
+	_, desc, ok := registry.Lookup(toolName)
+	return desc, ok, nil
+}
+
 func (s *ToolGatewayService) CallTool(ctx context.Context, session ToolSessionContext, payload ToolCallPayload) (map[string]any, error) {
+	ctx, cancel := toolcontext.Bind(ctx, session)
+	defer cancel()
+
 	toolName := strings.TrimSpace(payload.Name)
 	if toolName == "" {
-		return nil, fmt.Errorf("tool name is required")
+		return nil, errors.New("tool name is required")
 	}
 
 	registry, err := s.getRegistry(ctx, session, false)
 	if err != nil {
 		return nil, err
 	}
-	executor, _, ok := registry.Lookup(toolName)
+	source, _, ok := registry.Lookup(toolName)
 	if !ok {
-		// Refresh once for dynamic executors/sources.
 		registry, err = s.getRegistry(ctx, session, true)
 		if err != nil {
 			return nil, err
 		}
-		executor, _, ok = registry.Lookup(toolName)
+		source, _, ok = registry.Lookup(toolName)
 		if !ok {
-			return BuildToolErrorResult("tool not found: " + toolName), nil
+			return s.limitResult(toolName, BuildToolErrorResult("tool not found: "+toolName)), nil
 		}
 	}
 
@@ -105,27 +123,39 @@ func (s *ToolGatewayService) CallTool(ctx context.Context, session ToolSessionCo
 	if arguments == nil {
 		arguments = map[string]any{}
 	}
-	result, err := executor.CallTool(ctx, session, toolName, arguments)
+	if err := toolcontext.ValidateRuntimeGuard(ctx, session); err != nil {
+		return nil, err
+	}
+	result, err := source.CallTool(ctx, session, toolName, arguments)
 	if err != nil {
 		if errors.Is(err, ErrToolNotFound) {
-			return BuildToolErrorResult("tool not found: " + toolName), nil
+			return s.limitResult(toolName, BuildToolErrorResult("tool not found: "+toolName)), nil
 		}
-		return BuildToolErrorResult(err.Error()), nil
+		return s.limitResult(toolName, BuildToolErrorResult(err.Error())), nil
 	}
 	if result == nil {
-		return BuildToolSuccessResult(map[string]any{"ok": true}), nil
+		return s.limitResult(toolName, BuildToolSuccessResult(map[string]any{"ok": true})), nil
 	}
-	return result, nil
+	return s.limitResult(toolName, result), nil
+}
+
+func (s *ToolGatewayService) limitResult(toolName string, result map[string]any) map[string]any {
+	limit := ToolOutputLimit{}
+	if s != nil {
+		limit = s.limit
+	}
+	return LimitToolResult(result, "tool result ("+toolName+")", limit)
 }
 
 func (s *ToolGatewayService) getRegistry(ctx context.Context, session ToolSessionContext, force bool) (*ToolRegistry, error) {
 	botID := strings.TrimSpace(session.BotID)
 	if botID == "" {
-		return nil, fmt.Errorf("bot id is required")
+		return nil, errors.New("bot id is required")
 	}
+	cacheKey := toolRegistryCacheKey(session)
 	if !force {
 		s.mu.Lock()
-		cached, ok := s.cache[botID]
+		cached, ok := s.cache[cacheKey]
 		if ok && time.Now().Before(cached.expiresAt) && cached.registry != nil {
 			s.mu.Unlock()
 			return cached.registry, nil
@@ -134,36 +164,76 @@ func (s *ToolGatewayService) getRegistry(ctx context.Context, session ToolSessio
 	}
 
 	registry := NewToolRegistry()
-	for _, executor := range s.executors {
-		tools, err := executor.ListTools(ctx, session)
-		if err != nil {
-			s.logger.Warn("list tools from executor failed", slog.Any("error", err))
-			continue
-		}
-		for _, tool := range tools {
-			if err := registry.Register(executor, tool); err != nil {
-				s.logger.Warn("skip duplicated/invalid tool", slog.String("tool", tool.Name), slog.Any("error", err))
-			}
-		}
-	}
 	for _, source := range s.sources {
 		tools, err := source.ListTools(ctx, session)
 		if err != nil {
-			s.logger.Warn("list tools from source failed", slog.Any("error", err))
+			s.logger.WarnContext(ctx, "list tools from source failed", slog.Any("error", err))
 			continue
 		}
 		for _, tool := range tools {
 			if err := registry.Register(source, tool); err != nil {
-				s.logger.Warn("skip duplicated/invalid tool", slog.String("tool", tool.Name), slog.Any("error", err))
+				s.logger.WarnContext(ctx, "skip duplicated/invalid tool", slog.String("tool", tool.Name), slog.Any("error", err))
 			}
 		}
 	}
 
 	s.mu.Lock()
-	s.cache[botID] = cachedToolRegistry{
+	s.cache[cacheKey] = cachedToolRegistry{
 		expiresAt: time.Now().Add(s.cacheTTL),
 		registry:  registry,
 	}
 	s.mu.Unlock()
 	return registry, nil
+}
+
+func toolRegistryCacheKey(session ToolSessionContext) string {
+	parts := []string{
+		strings.TrimSpace(session.BotID),
+		strings.TrimSpace(session.UserID),
+		strings.TrimSpace(session.ChatID),
+		strings.TrimSpace(session.RuntimeID),
+		hashCacheKeySecret(session.RuntimeToken),
+		strings.TrimSpace(session.SessionID),
+		strings.TrimSpace(session.RunID),
+		strings.TrimSpace(session.SessionType),
+		strings.TrimSpace(session.RouteID),
+		strings.TrimSpace(session.ChannelIdentityID),
+		strings.TrimSpace(session.CurrentPlatform),
+		strings.TrimSpace(session.ReplyTarget),
+		strings.TrimSpace(session.ConversationType),
+		hashCacheKeySecret(session.SessionToken),
+	}
+	if session.PublicRequest {
+		parts = append(parts, "public-request")
+	}
+	if session.IsSubagent {
+		parts = append(parts, "subagent")
+	} else {
+		parts = append(parts, "agent")
+	}
+	if session.SupportsImageInput {
+		parts = append(parts, "vision")
+	} else {
+		parts = append(parts, "no-vision")
+	}
+	if session.CanRequestUserInput {
+		parts = append(parts, "user-input")
+	} else {
+		parts = append(parts, "no-user-input")
+	}
+	if session.CanListUserInput {
+		parts = append(parts, "list-user-input")
+	} else {
+		parts = append(parts, "no-list-user-input")
+	}
+	return strings.Join(parts, "\x00")
+}
+
+func hashCacheKeySecret(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
 }

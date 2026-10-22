@@ -1,14 +1,20 @@
 import { parse } from 'toml'
 import { readFileSync } from 'fs'
-import type { Config } from './types.ts'
+import type { Config } from './types'
 
 export const loadConfig = (path: string = './config.toml'): Config => {
   const config = parse(readFileSync(path, 'utf-8'))
+  if ('mcp' in config) {
+    if ('workspace' in config) {
+      throw new Error('config uses both [mcp] and [workspace]; remove [mcp] and move workspace fields into [container]')
+    }
+    throw new Error('config section [mcp] has been replaced by workspace fields in [container]; update your config.toml and restart')
+  }
   return config satisfies Config
 }
 
 export const getBaseUrl = (config: Config) => {
-  const rawAddr = typeof config.server.addr === 'string' ? config.server.addr.trim() : ''
+  const rawAddr = (config.agent_gateway?.server_addr || config.server?.addr || '').trim()
 
   if (!rawAddr) {
     return 'http://127.0.0.1'
@@ -25,4 +31,4 @@ export const getBaseUrl = (config: Config) => {
   return `http://${rawAddr}`
 }
 
-export * from './types.ts'
+export * from './types'

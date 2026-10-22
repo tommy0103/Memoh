@@ -1,0 +1,255 @@
+<template>
+  <!-- One reserved row under every turn. The height is always present so the
+       layout never jumps; only visibility toggles. While the turn is still
+       streaming the row stays fully hidden (no hover reveal) — actions on an
+       in-flight answer are meaningless. `invisible` (not just opacity) also
+       drops the buttons from the Tab order and accessibility tree, so keyboard
+       focus can't land on controls nobody can see. The latest FINISHED turn keeps it
+       visible; every other turn reveals it on pointer/focus within the turn's
+       hover scope (group/msg, set on the message content wrapper). An open
+       "more" menu also keeps the row shown: the menu is portaled out of the
+       turn and takes focus, so neither hover nor focus-within would hold while
+       the pointer is inside it.
+
+       Alignment differs by role on purpose:
+       - assistant (`start`): the hover hit-area overflows the text's left edge
+         a little (`-ml-1.5`), but NOT by the full button padding — the glyph then
+         sits a few px RIGHT of the text's left edge, which reads as visually
+         settled rather than a glyph hard-pinned to the margin.
+       - user (`end`): the hover hit-area's RIGHT edge meets the bubble's right
+         edge (`justify-end`, no negative margin), so the cluster lines up with
+         the bubble it belongs to. -->
+  <div
+    class="chat-message-meta flex h-8 items-center gap-0.5 transition-opacity duration-[180ms] ease-out motion-reduce:transition-none"
+    :class="[
+      align === 'end' ? 'justify-end' : 'justify-start -ml-1.5',
+      streaming
+        ? 'invisible opacity-0 pointer-events-none'
+        : persistent
+          ? 'opacity-100'
+          : 'opacity-0 pointer-events-none group-hover/msg:opacity-100 group-hover/msg:pointer-events-auto focus-within:opacity-100 focus-within:pointer-events-auto has-[[aria-expanded=true]]:opacity-100 has-[[aria-expanded=true]]:pointer-events-auto',
+    ]"
+  >
+    <!-- The tooltip is owned entirely by its trigger (the icon button): moving
+         the pointer onto the tooltip itself must NOT keep it alive. Without
+         this, the hover row could fade out while a stranded tooltip lingered
+         over an already-gone button. -->
+    <TooltipProvider
+      :delay-duration="0"
+      :disable-hoverable-content="true"
+    >
+      <!-- Copy — shared by both roles. The tooltip stays closed while the
+           button shows its check, so the check is the only confirmation. -->
+      <Tooltip
+        :open="copyTooltipOpen && !copyBusy"
+        @update:open="copyTooltipOpen = $event"
+      >
+        <TooltipTrigger as-child>
+          <CopyActionButton
+            v-model:busy="copyBusy"
+            :text="copyText"
+            :class="actionIconClass"
+          />
+        </TooltipTrigger>
+        <TooltipContent side="bottom">
+          {{ t('chat.actions.copy') }}
+        </TooltipContent>
+      </Tooltip>
+
+      <template v-if="role === 'user' && onEdit">
+        <Tooltip>
+          <TooltipTrigger as-child>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              :class="actionIconClass"
+              :aria-label="t('chat.actions.edit')"
+              @click="onEdit"
+            >
+              <PencilLine class="size-4" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">
+            {{ t('chat.actions.edit') }}
+          </TooltipContent>
+        </Tooltip>
+      </template>
+
+      <template v-if="role === 'assistant'">
+        <Tooltip v-if="onRetry">
+          <TooltipTrigger as-child>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              :class="actionIconClass"
+              :aria-label="t('chat.actions.retry')"
+              @click="handleRetry"
+            >
+              <!-- One counter-clockwise turn acknowledges the click. No check:
+                   retry has only started, and the regenerated turn replaces
+                   this row. -->
+              <RotateCcw
+                class="size-4"
+                :class="{ 'retry-spin-once': retrySpinning }"
+                @animationend="retrySpinning = false"
+              />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">
+            {{ t('chat.actions.retry') }}
+          </TooltipContent>
+        </Tooltip>
+
+        <template v-if="inlineActions">
+          <Tooltip v-if="onFork">
+            <TooltipTrigger as-child>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                :class="actionIconClass"
+                :aria-label="t('chat.actions.createFork')"
+                @click="onFork"
+              >
+                <ForkSplitIcon class="size-4" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">
+              {{ t('chat.actions.createFork') }}
+            </TooltipContent>
+          </Tooltip>
+          <span
+            v-if="timeLabel"
+            class="ml-1.5 min-w-0 truncate text-xs text-muted-foreground"
+            :title="fullTime"
+          >
+            {{ timeLabel }}
+          </span>
+        </template>
+        <DropdownMenu v-else>
+          <DropdownMenuTrigger as-child>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              :class="actionIconClass"
+              :aria-label="t('chat.actions.more')"
+            >
+              <DotsIcon class="size-[18px]" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent
+            side="top"
+            align="start"
+            class="min-w-[12rem]"
+          >
+            <DropdownMenuLabel
+              class="text-label font-normal text-muted-foreground"
+              :title="fullTime"
+            >
+              {{ timeLabel }}
+            </DropdownMenuLabel>
+            <DropdownMenuItem
+              v-if="onFork"
+              @select="onFork"
+            >
+              <ForkSplitIcon class="size-4" />
+              <span>{{ t('chat.actions.createFork') }}</span>
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </template>
+    </TooltipProvider>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref } from 'vue'
+import { useI18n } from 'vue-i18n'
+import { PencilLine, RotateCcw } from 'lucide-vue-next'
+import CopyActionButton from './copy-action-button.vue'
+import ForkSplitIcon from './fork-split-icon.vue'
+import DotsIcon from './dots-icon.vue'
+import {
+  Button,
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuLabel,
+  DropdownMenuItem,
+} from '@felinic/ui'
+
+const props = defineProps<{
+  copyText: string
+  role: 'user' | 'assistant'
+  timeLabel?: string
+  inlineActions?: boolean
+  fullTime?: string
+  persistent?: boolean
+  streaming?: boolean
+  align?: 'start' | 'end'
+  onRetry?: () => void
+  onEdit?: () => void
+  onFork?: () => void
+}>()
+
+const { t } = useI18n()
+const actionIconClass = 'message-action-press text-muted-foreground transition-colors duration-[60ms] hover:text-foreground'
+
+const copyBusy = ref(false)
+const copyTooltipOpen = ref(false)
+
+const retrySpinning = ref(false)
+
+function handleRetry() {
+  props.onRetry?.()
+  retrySpinning.value = true
+}
+</script>
+
+<style scoped>
+/* These small icons press as one object: the hover chip and the glyph shrink
+   together to 0.92 (the shared ghost press only shrinks the chip to 0.974,
+   which barely reads at this size). The glyph is the slot child under Button's
+   [data-button-content] wrapper, which is `display: contents` and so cannot be
+   transformed itself; :deep reaches it inside the copy button as well. */
+.chat-message-meta :deep(.message-action-press)::before {
+  transition:
+    scale 80ms ease-out,
+    background-color 60ms;
+}
+
+.chat-message-meta :deep(.message-action-press:active)::before {
+  scale: 0.92;
+}
+
+.chat-message-meta :deep(.message-action-press [data-button-content] > *) {
+  transition: transform 80ms ease-out;
+}
+
+.chat-message-meta :deep(.message-action-press:active [data-button-content] > *) {
+  transform: scale(0.92);
+}
+
+.retry-spin-once {
+  animation: retry-spin-once 200ms ease-out;
+}
+
+@keyframes retry-spin-once {
+  to {
+    rotate: -360deg;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .retry-spin-once {
+    animation: none;
+  }
+}
+</style>

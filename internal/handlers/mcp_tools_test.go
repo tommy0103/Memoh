@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -12,7 +13,8 @@ import (
 	"github.com/labstack/echo/v4"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
-	mcpgw "github.com/memohai/memoh/internal/mcp"
+	"github.com/felinics/memoh/internal/apperror"
+	mcpgw "github.com/felinics/memoh/internal/mcp"
 )
 
 func TestBuildToolCallPayloadFromRaw(t *testing.T) {
@@ -42,7 +44,7 @@ func TestBuildToolCallPayloadFromRaw(t *testing.T) {
 
 func TestHandleMCPToolsWithoutGateway(t *testing.T) {
 	e := echo.New()
-	req := httptest.NewRequest(http.MethodPost, "/bots/bot-1/tools", strings.NewReader(`{"jsonrpc":"2.0","id":"1","method":"tools/list"}`))
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/bots/bot-1/tools", strings.NewReader(`{"jsonrpc":"2.0","id":"1","method":"tools/list"}`))
 	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
@@ -55,7 +57,8 @@ func TestHandleMCPToolsWithoutGateway(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected service unavailable error")
 	}
-	httpErr, ok := err.(*echo.HTTPError)
+	httpErr := &echo.HTTPError{}
+	ok := errors.As(err, &httpErr)
 	if !ok {
 		t.Fatalf("expected echo HTTP error, got %T", err)
 	}
@@ -68,7 +71,7 @@ type mcpToolsTestExecutor struct {
 	lastSession mcpgw.ToolSessionContext
 }
 
-func (e *mcpToolsTestExecutor) ListTools(ctx context.Context, session mcpgw.ToolSessionContext) ([]mcpgw.ToolDescriptor, error) {
+func (e *mcpToolsTestExecutor) ListTools(_ context.Context, session mcpgw.ToolSessionContext) ([]mcpgw.ToolDescriptor, error) {
 	e.lastSession = session
 	return []mcpgw.ToolDescriptor{
 		{
@@ -84,7 +87,7 @@ func (e *mcpToolsTestExecutor) ListTools(ctx context.Context, session mcpgw.Tool
 	}, nil
 }
 
-func (e *mcpToolsTestExecutor) CallTool(ctx context.Context, session mcpgw.ToolSessionContext, toolName string, arguments map[string]any) (map[string]any, error) {
+func (e *mcpToolsTestExecutor) CallTool(_ context.Context, session mcpgw.ToolSessionContext, toolName string, arguments map[string]any) (map[string]any, error) {
 	e.lastSession = session
 	if strings.TrimSpace(toolName) != "echo_tool" {
 		return nil, mcpgw.ErrToolNotFound
@@ -97,16 +100,28 @@ func (e *mcpToolsTestExecutor) CallTool(ctx context.Context, session mcpgw.ToolS
 	}), nil
 }
 
+type mcpToolsRuntimeResolver struct {
+	session mcpgw.ToolSessionContext
+	ok      bool
+}
+
+func (r mcpToolsRuntimeResolver) ResolveRuntimeToolContext(botID, runtimeID, toolToken string) (mcpgw.ToolSessionContext, bool) {
+	if botID != r.session.BotID || runtimeID != r.session.RuntimeID || toolToken != r.session.RuntimeToken {
+		return mcpgw.ToolSessionContext{}, false
+	}
+	return r.session, r.ok
+}
+
 func TestHandleMCPToolsWithGatewayAcceptCompatibility(t *testing.T) {
 	e := echo.New()
 	executor := &mcpToolsTestExecutor{}
-	toolGateway := mcpgw.NewToolGatewayService(slog.Default(), []mcpgw.ToolExecutor{executor}, nil)
+	toolGateway := mcpgw.NewToolGatewayService(slog.Default(), []mcpgw.ToolSource{executor})
 	handler := &ContainerdHandler{
 		logger:      slog.Default(),
 		toolGateway: toolGateway,
 	}
 
-	listReq := httptest.NewRequest(http.MethodPost, "/bots/bot-1/tools", strings.NewReader(`{"jsonrpc":"2.0","id":"1","method":"tools/list"}`))
+	listReq := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/bots/bot-1/tools", strings.NewReader(`{"jsonrpc":"2.0","id":"1","method":"tools/list"}`))
 	listReq.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
 	listReq.Header.Set("Accept", "application/json")
 	listReq.Header.Set("X-Memoh-Channel-Identity-Id", "user-1")
@@ -128,12 +143,18 @@ func TestHandleMCPToolsWithGatewayAcceptCompatibility(t *testing.T) {
 		t.Fatalf("decode list payload failed: %v", err)
 	}
 	result, _ := listPayload["result"].(map[string]any)
+	if cacheScope, _ := result["cacheScope"].(string); cacheScope != "private" {
+		t.Fatalf("tools/list cacheScope = %#v, want private", result["cacheScope"])
+	}
+	if ttlMs, ok := result["ttlMs"].(float64); !ok || ttlMs != 0 {
+		t.Fatalf("tools/list ttlMs = %#v, want 0", result["ttlMs"])
+	}
 	tools, _ := result["tools"].([]any)
 	if len(tools) != 1 {
 		t.Fatalf("expected one tool, got: %#v", result["tools"])
 	}
 
-	callReq := httptest.NewRequest(http.MethodPost, "/bots/bot-1/tools", strings.NewReader(`{"jsonrpc":"2.0","id":"2","method":"tools/call","params":{"name":"echo_tool","arguments":{"input":"hello"}}}`))
+	callReq := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/bots/bot-1/tools", strings.NewReader(`{"jsonrpc":"2.0","id":"2","method":"tools/call","params":{"name":"echo_tool","arguments":{"input":"hello"}}}`))
 	callReq.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
 	callReq.Header.Set("Accept", "application/json")
 	callReq.Header.Set("X-Memoh-Channel-Identity-Id", "user-1")
@@ -159,7 +180,196 @@ func TestHandleMCPToolsWithGatewayAcceptCompatibility(t *testing.T) {
 	if strings.TrimSpace(mcpgw.StringArg(structured, "chat_id")) != "bot-1" {
 		t.Fatalf("unexpected chat id: %#v", structured["chat_id"])
 	}
-	if strings.TrimSpace(mcpgw.StringArg(structured, "channel_identity_id")) != "user-1" {
-		t.Fatalf("unexpected channel identity id: %#v", structured["channel_identity_id"])
+	if strings.TrimSpace(mcpgw.StringArg(structured, "channel_identity_id")) != "" {
+		t.Fatalf("public header should not set channel identity id: %#v", structured["channel_identity_id"])
+	}
+}
+
+func TestHandleMCPToolsRuntimeIDUsesTrustedRuntimeContext(t *testing.T) {
+	e := echo.New()
+	executor := &mcpToolsTestExecutor{}
+	trusted := mcpgw.ToolSessionContext{
+		BotID:              "bot-1",
+		ChatID:             "trusted-chat",
+		RuntimeID:          "runtime-1",
+		RuntimeToken:       "runtime-token-1",
+		SessionID:          "trusted-session",
+		RunID:              "trusted-run",
+		ChannelIdentityID:  "trusted-user",
+		SupportsImageInput: true,
+		RuntimeActive:      true,
+	}
+	handler := &ContainerdHandler{
+		logger:      slog.Default(),
+		toolGateway: mcpgw.NewToolGatewayService(slog.Default(), []mcpgw.ToolSource{executor}),
+		acpRuntimes: mcpToolsRuntimeResolver{session: trusted, ok: true},
+	}
+
+	callReq := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/bots/bot-1/tools", strings.NewReader(`{"jsonrpc":"2.0","id":"2","method":"tools/call","params":{"name":"echo_tool","arguments":{"input":"hello"}}}`))
+	callReq.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	callReq.Header.Set("Accept", "application/json")
+	callReq.Header.Set(mcpgw.ToolHeaderRuntimeID, "runtime-1")
+	callReq.Header.Set(mcpgw.ToolHeaderRuntimeToken, "runtime-token-1")
+	callReq.Header.Set(headerChatID, "untrusted-chat")
+	callReq.Header.Set(headerSessionID, "untrusted-session")
+	callReq.Header.Set(mcpgw.ToolHeaderSupportsImageInput, "false")
+	callRec := httptest.NewRecorder()
+	callCtx := e.NewContext(callReq, callRec)
+
+	if err := handler.handleMCPToolsWithBotID(callCtx, "bot-1"); err != nil {
+		t.Fatalf("call tool should succeed: %v", err)
+	}
+	if callRec.Code != http.StatusOK {
+		t.Fatalf("unexpected call status: %d body=%s", callRec.Code, callRec.Body.String())
+	}
+	if executor.lastSession.ChatID != trusted.ChatID ||
+		executor.lastSession.SessionID != trusted.SessionID ||
+		executor.lastSession.RunID != trusted.RunID ||
+		executor.lastSession.ChannelIdentityID != trusted.ChannelIdentityID ||
+		!executor.lastSession.SupportsImageInput ||
+		!executor.lastSession.RuntimeActive {
+		t.Fatalf("runtime request did not use trusted resolver context: %#v", executor.lastSession)
+	}
+}
+
+func TestHandleMCPToolsRuntimeIDRequiresRuntimeToolToken(t *testing.T) {
+	e := echo.New()
+	executor := &mcpToolsTestExecutor{}
+	trusted := mcpgw.ToolSessionContext{
+		BotID:         "bot-1",
+		RuntimeID:     "runtime-1",
+		RuntimeToken:  "runtime-token-1",
+		RuntimeActive: true,
+	}
+	handler := &ContainerdHandler{
+		logger:      slog.Default(),
+		toolGateway: mcpgw.NewToolGatewayService(slog.Default(), []mcpgw.ToolSource{executor}),
+		acpRuntimes: mcpToolsRuntimeResolver{session: trusted, ok: true},
+	}
+
+	callReq := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/bots/bot-1/tools", strings.NewReader(`{"jsonrpc":"2.0","id":"2","method":"tools/list"}`))
+	callReq.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	callReq.Header.Set("Accept", "application/json")
+	callReq.Header.Set(mcpgw.ToolHeaderRuntimeID, "runtime-1")
+	callRec := httptest.NewRecorder()
+	callCtx := e.NewContext(callReq, callRec)
+
+	err := handler.handleMCPToolsWithBotID(callCtx, "bot-1")
+	if err == nil {
+		t.Fatal("runtime tool request without token should fail")
+	}
+	if apperror.CodeOf(err) != apperror.CodeACPRuntimeNotFound {
+		t.Fatalf("runtime tool request without token error = %v, want acp.runtime_not_found", err)
+	}
+}
+
+func TestHandleMCPToolsCallRoutesPublicEventHeadersWithoutTrustingIdentity(t *testing.T) {
+	e := echo.New()
+	executor := &mcpToolsTestExecutor{}
+	toolGateway := mcpgw.NewToolGatewayService(slog.Default(), []mcpgw.ToolSource{executor})
+	toolContexts := mcpgw.NewToolSessionContextStore()
+	var delivered []mcpgw.ToolStreamEvent
+	unregister := toolContexts.RegisterToolEventSink(mcpgw.ToolSessionContext{
+		BotID:     "bot-1",
+		SessionID: "session-1",
+		RunID:     "run-1",
+	}, func(event mcpgw.ToolStreamEvent) {
+		delivered = append(delivered, event)
+	})
+	defer unregister()
+	handler := &ContainerdHandler{
+		logger:       slog.Default(),
+		toolGateway:  toolGateway,
+		toolContexts: toolContexts,
+	}
+
+	callReq := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/bots/bot-1/tools", strings.NewReader(`{"jsonrpc":"2.0","id":"2","method":"tools/call","params":{"name":"echo_tool","arguments":{"input":"hello"}}}`))
+	callReq.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	callReq.Header.Set("Accept", "application/json")
+	callReq.Header.Set(headerBotID, "bot-1")
+	callReq.Header.Set(headerChatID, "chat-1")
+	callReq.Header.Set(headerSessionID, "session-1")
+	callReq.Header.Set(headerRunID, "run-1")
+	callReq.Header.Set(headerSessionType, "acp_agent")
+	callReq.Header.Set(headerChannelIdentityID, "user-1")
+	callRec := httptest.NewRecorder()
+	callCtx := e.NewContext(callReq, callRec)
+
+	if err := handler.handleMCPToolsWithBotID(callCtx, "bot-1"); err != nil {
+		t.Fatalf("call tool should succeed: %v", err)
+	}
+	if callRec.Code != http.StatusOK {
+		t.Fatalf("unexpected call status: %d body=%s", callRec.Code, callRec.Body.String())
+	}
+
+	if len(delivered) != 2 {
+		t.Fatalf("delivered events = %#v, want start/end", delivered)
+	}
+	if delivered[0].Type != "tool_call_start" || delivered[1].Type != "tool_call_end" {
+		t.Fatalf("unexpected delivered events: %#v", delivered)
+	}
+	if executor.lastSession.ChannelIdentityID != "" || executor.lastSession.SessionToken != "" {
+		t.Fatalf("public identity/credential headers were trusted: %#v", executor.lastSession)
+	}
+}
+
+func TestBuildToolSessionContextPreservesRoutingHeadersAndIgnoresIdentityHeaders(t *testing.T) {
+	e := echo.New()
+	req := httptest.NewRequest(http.MethodPost, "/bots/bot-1/tools", nil)
+	req.Header.Set(headerBotID, "spoofed-bot")
+	req.Header.Set(headerChatID, "chat-1")
+	req.Header.Set(mcpgw.ToolHeaderRuntimeToken, "runtime-token-1")
+	req.Header.Set(headerSessionID, "session-1")
+	req.Header.Set(headerRunID, "run-1")
+	req.Header.Set(headerSessionType, "acp_agent")
+	req.Header.Set(headerRouteID, "route-1")
+	req.Header.Set(headerChannelIdentityID, "user-1")
+	req.Header.Set(headerSessionToken, "token-1")
+	req.Header.Set(headerCurrentPlatform, "web")
+	req.Header.Set(headerReplyTarget, "reply-1")
+	req.Header.Set(headerConversationType, "private")
+	req.Header.Set(headerIsSubagent, "true")
+	req.Header.Set(mcpgw.ToolHeaderSupportsImageInput, "true")
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+
+	session := (&ContainerdHandler{}).buildToolSessionContext(c, "fallback-bot")
+	if session.BotID != "fallback-bot" || session.ChatID != "chat-1" {
+		t.Fatalf("unexpected base ids: %#v", session)
+	}
+	if session.SessionID != "session-1" ||
+		session.RunID != "run-1" ||
+		session.SessionType != "acp_agent" ||
+		session.RouteID != "route-1" ||
+		session.CurrentPlatform != "web" ||
+		session.ReplyTarget != "reply-1" ||
+		session.ConversationType != "private" ||
+		!session.IsSubagent {
+		t.Fatalf("routing headers were not preserved: %#v", session)
+	}
+	if session.RuntimeToken != "" || session.ChannelIdentityID != "" || session.SessionToken != "" {
+		t.Fatalf("public identity/credential headers should be ignored: %#v", session)
+	}
+	if session.SupportsImageInput {
+		t.Fatalf("public endpoint should not trust image capability header: %#v", session)
+	}
+	if session.CanRequestUserInput {
+		t.Fatalf("public endpoint should not trust stream id as user-input capability: %#v", session)
+	}
+}
+
+func TestBuildToolSessionContextUsesAuthenticatedIdentity(t *testing.T) {
+	e := echo.New()
+	req := httptest.NewRequest(http.MethodPost, "/bots/bot-1/tools", nil)
+	req.Header.Set(headerChannelIdentityID, "spoofed-user")
+	rec := httptest.NewRecorder()
+	c := testAuthContext(e, req, rec, "user-1")
+
+	session := (&ContainerdHandler{}).buildToolSessionContext(c, "bot-1")
+	if session.ChannelIdentityID != "user-1" {
+		t.Fatalf("channel identity = %q, want authenticated user", session.ChannelIdentityID)
+	}
+	if !session.PublicRequest || session.UserID != "user-1" {
+		t.Fatalf("public routing must be separated from the authenticated user: %#v", session)
 	}
 }

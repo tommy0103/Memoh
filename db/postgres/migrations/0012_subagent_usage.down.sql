@@ -1,0 +1,2 @@
+-- 0012_subagent_usage (rollback)
+-- (no-op: subagents table removed in 0043)

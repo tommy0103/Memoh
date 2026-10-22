@@ -1,9 +1,17 @@
 package schedule
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrSessionBusy is returned by a Triggerer when the target session already
+// has an active run. The fire is dropped, not retried.
+var ErrSessionBusy = errors.New("session busy")
 
 // TriggerPayload describes the parameters passed to the chat side when a schedule triggers.
 type TriggerPayload struct {
+	FireID      string
 	ID          string
 	Name        string
 	Description string
@@ -11,9 +19,24 @@ type TriggerPayload struct {
 	MaxCalls    *int
 	Command     string
 	OwnerUserID string
+	SessionID   string
+	// ModelID / RuntimeModelID / ReasoningEffort are the schedule's per-run
+	// overrides. Which runtime executes the run is decided by the session
+	// itself (its runtime_type and metadata), never by the payload.
+	ModelID         string
+	RuntimeModelID  string
+	ReasoningEffort string
+}
+
+// TriggerResult carries execution metadata back from the resolver.
+type TriggerResult struct {
+	Status     string
+	Text       string
+	UsageBytes []byte
+	ModelID    string
 }
 
 // Triggerer triggers schedule execution for chat-related jobs.
 type Triggerer interface {
-	TriggerSchedule(ctx context.Context, botID string, payload TriggerPayload, token string) error
+	TriggerSchedule(ctx context.Context, botID string, payload TriggerPayload, token string) (TriggerResult, error)
 }

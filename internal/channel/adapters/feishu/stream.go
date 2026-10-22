@@ -3,8 +3,9 @@ package feishu
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"regexp"
+	"log/slog"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -13,7 +14,8 @@ import (
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
-	"github.com/memohai/memoh/internal/channel"
+	"github.com/felinics/memoh/internal/channel"
+	"github.com/felinics/memoh/internal/redact"
 )
 
 const (
@@ -32,19 +34,27 @@ type feishuOutboundStream struct {
 	receiveID     string
 	receiveType   string
 	cardMessageID string
+	// useCardKit sends text cards as CardKit card entities so text can be
+	// streamed into them; cardID and cardSequence track the current entity.
+	// When cardID is empty the current card is updated by patching the
+	// message instead.
+	useCardKit    bool
+	cardID        string
+	cardSequence  int
 	textBuffer    strings.Builder
 	lastPatchedAt time.Time
 	lastPatched   string
 	patchInterval time.Duration
 	closed        atomic.Bool
+	toolMessages  map[string]string
 }
 
-func (s *feishuOutboundStream) Push(ctx context.Context, event channel.StreamEvent) error {
+func (s *feishuOutboundStream) Push(ctx context.Context, event channel.PreparedStreamEvent) error {
 	if s == nil || s.adapter == nil {
-		return fmt.Errorf("feishu stream not configured")
+		return errors.New("feishu stream not configured")
 	}
 	if s.closed.Load() {
-		return fmt.Errorf("feishu stream is closed")
+		return errors.New("feishu stream is closed")
 	}
 	select {
 	case <-ctx.Done():
@@ -58,7 +68,7 @@ func (s *feishuOutboundStream) Push(ctx context.Context, event channel.StreamEve
 		}
 		return nil
 	case channel.StreamEventDelta:
-		if event.Delta == "" {
+		if event.Delta == "" || event.Phase == channel.StreamPhaseReasoning {
 			return nil
 		}
 		s.textBuffer.WriteString(event.Delta)
@@ -69,35 +79,51 @@ func (s *feishuOutboundStream) Push(ctx context.Context, event channel.StreamEve
 			return nil
 		}
 		return s.patchCard(ctx, s.textBuffer.String())
-	case channel.StreamEventToolCallStart:
-		if err := s.ensureCard(ctx, feishuStreamToolHintText); err != nil {
-			return err
-		}
-		return s.patchCard(ctx, feishuStreamToolHintText)
-	case channel.StreamEventToolCallEnd:
+	case channel.StreamEventReset:
+		// Keep the card; the regenerated reply patches over the failed text.
+		s.textBuffer.Reset()
 		return nil
+	case channel.StreamEventToolCallStart:
+		s.commitSegment(ctx)
+		return s.renderToolCallCard(ctx, event.ToolCall, channel.BuildToolCallStart(event.ToolCall))
+	case channel.StreamEventSegmentEnd:
+		// The text before a hidden tool call keeps its own card. With nothing
+		// buffered, keep the placeholder card for the text that follows.
+		if strings.TrimSpace(s.textBuffer.String()) != "" {
+			s.commitSegment(ctx)
+		}
+		return nil
+	case channel.StreamEventToolCallEnd:
+		s.finishCard(ctx)
+		s.cardMessageID = ""
+		s.lastPatched = ""
+		s.lastPatchedAt = time.Time{}
+		s.textBuffer.Reset()
+		return s.renderToolCallCard(ctx, event.ToolCall, channel.BuildToolCallEnd(event.ToolCall))
 	case channel.StreamEventAttachment:
 		if len(event.Attachments) == 0 {
 			return nil
 		}
-		media := channel.Message{
-			Attachments: event.Attachments,
-		}
-		return s.adapter.Send(ctx, s.cfg, channel.OutboundMessage{
-			Target:  s.target,
-			Message: media,
+		return s.adapter.Send(ctx, s.cfg, channel.PreparedOutboundMessage{
+			Target: s.target,
+			Message: channel.PreparedMessage{
+				Message: channel.Message{
+					Attachments: feishuLogicalAttachments(event.Attachments),
+				},
+				Attachments: event.Attachments,
+			},
 		})
-	case channel.StreamEventAgentStart, channel.StreamEventAgentEnd, channel.StreamEventPhaseStart, channel.StreamEventPhaseEnd, channel.StreamEventProcessingStarted, channel.StreamEventProcessingCompleted, channel.StreamEventProcessingFailed:
+	case channel.StreamEventPhaseStart, channel.StreamEventPhaseEnd:
+		return nil
+	case channel.StreamEventAgentStart, channel.StreamEventAgentEnd, channel.StreamEventProcessingStarted, channel.StreamEventProcessingCompleted:
 		return nil
 	case channel.StreamEventFinal:
-		if event.Final == nil || event.Final.Message.IsEmpty() {
+		if event.Final == nil || event.Final.Message.Message.IsEmpty() {
 			return nil
 		}
 		msg := event.Final.Message
-		finalText := strings.TrimSpace(msg.PlainText())
-		if finalText == "" {
-			finalText = strings.TrimSpace(s.textBuffer.String())
-		}
+		bufText := strings.TrimSpace(s.textBuffer.String())
+		finalText := renderFeishuStreamFinalText(msg.Message, bufText)
 		if finalText != "" {
 			if err := s.ensureCard(ctx, feishuStreamThinkingText); err != nil {
 				return err
@@ -106,31 +132,75 @@ func (s *feishuOutboundStream) Push(ctx context.Context, event channel.StreamEve
 				return err
 			}
 		}
+		s.finishCard(ctx)
 		if len(msg.Attachments) > 0 {
 			media := msg
-			media.Format = ""
-			media.Text = ""
-			media.Parts = nil
-			media.Actions = nil
-			media.Reply = nil
-			return s.adapter.Send(ctx, s.cfg, channel.OutboundMessage{
+			media.Message.Format = ""
+			media.Message.Text = ""
+			media.Message.Parts = nil
+			media.Message.Actions = nil
+			media.Message.Reply = nil
+			media.Message.Attachments = feishuLogicalAttachments(media.Attachments)
+			return s.adapter.Send(ctx, s.cfg, channel.PreparedOutboundMessage{
 				Target:  s.target,
 				Message: media,
 			})
 		}
 		return nil
 	case channel.StreamEventError:
-		errText := strings.TrimSpace(event.Error)
+		errText := redact.Text(strings.TrimSpace(event.Error))
 		if errText == "" {
 			return nil
 		}
 		if err := s.ensureCard(ctx, feishuStreamThinkingText); err != nil {
 			return err
 		}
-		return s.patchCard(ctx, "Error: "+errText)
+		err := s.patchCard(ctx, channel.ErrorReplyText(event.ErrorCode, errText))
+		s.finishCard(ctx)
+		return err
 	default:
 		return nil
 	}
+}
+
+// commitSegment patches the buffered text into the current card and resets
+// the streaming state, so the next text opens a fresh card.
+func (s *feishuOutboundStream) commitSegment(ctx context.Context) {
+	bufText := strings.TrimSpace(s.textBuffer.String())
+	if s.cardMessageID != "" && bufText != "" {
+		_ = s.patchCard(ctx, bufText)
+	}
+	s.finishCard(ctx)
+	s.cardMessageID = ""
+	s.lastPatched = ""
+	s.lastPatchedAt = time.Time{}
+	s.textBuffer.Reset()
+}
+
+func renderFeishuStreamFinalText(msg channel.Message, buffered string) string {
+	if len(msg.Parts) > 0 {
+		if body := renderFeishuMessagePartsLarkMD(msg); body != "" {
+			if len([]rune(body)) > feishuStreamMaxRunes {
+				return channel.RenderPartsAsPlain(msg.Parts)
+			}
+			return body
+		}
+	}
+	if authoritative := strings.TrimSpace(msg.PlainText()); authoritative != "" {
+		return authoritative
+	}
+	return strings.TrimSpace(buffered)
+}
+
+func feishuLogicalAttachments(attachments []channel.PreparedAttachment) []channel.Attachment {
+	if len(attachments) == 0 {
+		return nil
+	}
+	logical := make([]channel.Attachment, 0, len(attachments))
+	for _, att := range attachments {
+		logical = append(logical, att.Logical)
+	}
+	return logical
 }
 
 func (s *feishuOutboundStream) Close(ctx context.Context) error {
@@ -143,6 +213,7 @@ func (s *feishuOutboundStream) Close(ctx context.Context) error {
 	default:
 	}
 	s.closed.Store(true)
+	s.finishCard(ctx)
 	return nil
 }
 
@@ -151,11 +222,14 @@ func (s *feishuOutboundStream) ensureCard(ctx context.Context, text string) erro
 		return nil
 	}
 	if s.client == nil {
-		return fmt.Errorf("feishu client not configured")
+		return errors.New("feishu client not configured")
 	}
-	content, err := buildFeishuStreamCardContent(text)
-	if err != nil {
-		return err
+	cardID, content := s.createCardEntity(ctx, text)
+	if content == "" {
+		var err error
+		if content, err = buildFeishuStreamCardContent(text); err != nil {
+			return err
+		}
 	}
 	if s.reply != nil && strings.TrimSpace(s.reply.MessageID) != "" {
 		replyReq := larkim.NewReplyMessageReqBuilder().
@@ -166,7 +240,7 @@ func (s *feishuOutboundStream) ensureCard(ctx context.Context, text string) erro
 				Uuid(uuid.NewString()).
 				Build()).
 			Build()
-		replyResp, err := s.client.Im.V1.Message.Reply(ctx, replyReq)
+		replyResp, err := s.client.Im.Message.Reply(ctx, replyReq)
 		if err != nil {
 			return err
 		}
@@ -178,9 +252,10 @@ func (s *feishuOutboundStream) ensureCard(ctx context.Context, text string) erro
 			return fmt.Errorf("feishu stream reply failed: %s (code: %d)", msg, code)
 		}
 		if replyResp.Data == nil || replyResp.Data.MessageId == nil || strings.TrimSpace(*replyResp.Data.MessageId) == "" {
-			return fmt.Errorf("feishu stream reply failed: empty message id")
+			return errors.New("feishu stream reply failed: empty message id")
 		}
 		s.cardMessageID = strings.TrimSpace(*replyResp.Data.MessageId)
+		s.cardID, s.cardSequence = cardID, 0
 		s.lastPatched = normalizeFeishuStreamText(text)
 		s.lastPatchedAt = time.Now()
 		return nil
@@ -194,7 +269,7 @@ func (s *feishuOutboundStream) ensureCard(ctx context.Context, text string) erro
 			Uuid(uuid.NewString()).
 			Build()).
 		Build()
-	createResp, err := s.client.Im.V1.Message.Create(ctx, createReq)
+	createResp, err := s.client.Im.Message.Create(ctx, createReq)
 	if err != nil {
 		return err
 	}
@@ -206,9 +281,10 @@ func (s *feishuOutboundStream) ensureCard(ctx context.Context, text string) erro
 		return fmt.Errorf("feishu stream create failed: %s (code: %d)", msg, code)
 	}
 	if createResp.Data == nil || createResp.Data.MessageId == nil || strings.TrimSpace(*createResp.Data.MessageId) == "" {
-		return fmt.Errorf("feishu stream create failed: empty message id")
+		return errors.New("feishu stream create failed: empty message id")
 	}
 	s.cardMessageID = strings.TrimSpace(*createResp.Data.MessageId)
+	s.cardID, s.cardSequence = cardID, 0
 	s.lastPatched = normalizeFeishuStreamText(text)
 	s.lastPatchedAt = time.Now()
 	return nil
@@ -216,10 +292,18 @@ func (s *feishuOutboundStream) ensureCard(ctx context.Context, text string) erro
 
 func (s *feishuOutboundStream) patchCard(ctx context.Context, text string) error {
 	if strings.TrimSpace(s.cardMessageID) == "" {
-		return fmt.Errorf("feishu stream card message not initialized")
+		return errors.New("feishu stream card message not initialized")
 	}
 	contentText := normalizeFeishuStreamText(text)
 	if contentText == s.lastPatched {
+		return nil
+	}
+	if s.cardID != "" {
+		if err := s.streamCardEntityText(ctx, feishuStreamCardText(contentText)); err != nil {
+			return err
+		}
+		s.lastPatched = contentText
+		s.lastPatchedAt = time.Now()
 		return nil
 	}
 	content, err := buildFeishuStreamCardContent(contentText)
@@ -232,7 +316,7 @@ func (s *feishuOutboundStream) patchCard(ctx context.Context, text string) error
 			Content(content).
 			Build()).
 		Build()
-	patchResp, err := s.client.Im.V1.Message.Patch(ctx, patchReq)
+	patchResp, err := s.client.Im.Message.Patch(ctx, patchReq)
 	if err != nil {
 		return err
 	}
@@ -246,6 +330,73 @@ func (s *feishuOutboundStream) patchCard(ctx context.Context, text string) error
 	s.lastPatched = contentText
 	s.lastPatchedAt = time.Now()
 	return nil
+}
+
+// createCardEntity creates a streaming card entity for the next text card and
+// returns its ID with the message content that sends it. Both are empty when
+// CardKit is off for this stream or the entity cannot be created; the caller
+// then sends an ordinary card and patches the message.
+func (s *feishuOutboundStream) createCardEntity(ctx context.Context, text string) (string, string) {
+	if !s.useCardKit {
+		return "", ""
+	}
+	cardID, err := createFeishuCardEntity(ctx, s.client, text)
+	content := ""
+	if err == nil {
+		content, err = buildFeishuCardEntityMessageContent(cardID)
+	}
+	if err != nil {
+		s.useCardKit = false
+		if s.adapter != nil {
+			s.adapter.cardKit.markFailed(s.cfg.ID)
+			if s.adapter.logger != nil {
+				s.adapter.logger.WarnContext(ctx, "feishu: card entity unavailable, patching message cards instead",
+					slog.String("config_id", s.cfg.ID),
+					slog.Any("error", err),
+				)
+			}
+		}
+		return "", ""
+	}
+	return cardID, content
+}
+
+func (s *feishuOutboundStream) nextCardSequence() int {
+	s.cardSequence++
+	return s.cardSequence
+}
+
+// streamCardEntityText updates the current card entity's text. A rejected
+// update is retried once after reopening streaming mode, which Feishu closes
+// on its own ten minutes after it was opened.
+func (s *feishuOutboundStream) streamCardEntityText(ctx context.Context, text string) error {
+	err := streamFeishuCardEntityText(ctx, s.client, s.cardID, s.nextCardSequence(), text)
+	if err == nil {
+		return nil
+	}
+	if reopenErr := setFeishuCardEntityStreaming(ctx, s.client, s.cardID, s.nextCardSequence(), true); reopenErr != nil {
+		return errors.Join(err, reopenErr)
+	}
+	return streamFeishuCardEntityText(ctx, s.client, s.cardID, s.nextCardSequence(), text)
+}
+
+// finishCard closes streaming mode on the current card entity, if any. The
+// text is already final, so a failure only leaves the "[生成中...]" preview
+// until Feishu closes streaming itself, and is logged rather than returned.
+func (s *feishuOutboundStream) finishCard(ctx context.Context) {
+	if s.cardID == "" {
+		return
+	}
+	cardID := s.cardID
+	s.cardID = ""
+	if err := setFeishuCardEntityStreaming(ctx, s.client, cardID, s.nextCardSequence(), false); err != nil {
+		if s.adapter != nil && s.adapter.logger != nil {
+			s.adapter.logger.WarnContext(ctx, "feishu: close card entity streaming failed",
+				slog.String("config_id", s.cfg.ID),
+				slog.Any("error", err),
+			)
+		}
+	}
 }
 
 // extractReadableFromJSON tries to extract human-readable text from JSON-like content.
@@ -290,50 +441,153 @@ func extractReadableFromJSON(text string) string {
 	return text
 }
 
-func buildFeishuStreamCardContent(text string) (string, error) {
-	content := normalizeFeishuStreamText(extractReadableFromJSON(text))
-	body := processFeishuCardMarkdown(content)
-	card := map[string]any{
-		"config": map[string]any{
-			"wide_screen_mode": true,
-			"enable_forward":   true,
-			"update_multi":     true,
-		},
-		"elements": []map[string]any{
-			{
-				"tag": "div",
-				"fields": []map[string]any{
-					{
-						"is_short": false,
-						"text": map[string]any{
-							"tag":     "lark_md",
-							"content": body,
-						},
-					},
-				},
-			},
-		},
+// renderToolCallCard posts a card for tool_call_start and patches the same
+// card on tool_call_end, producing a single message whose status flips from
+// "running" to "completed"/"failed". If no prior card is tracked (or patching
+// fails), it falls back to creating a new card.
+func (s *feishuOutboundStream) renderToolCallCard(
+	ctx context.Context,
+	tc *channel.StreamToolCall,
+	p channel.ToolCallPresentation,
+) error {
+	text := strings.TrimSpace(channel.RenderToolCallMessageMarkdown(p))
+	if text == "" {
+		return nil
 	}
-	data, err := json.Marshal(card)
+	if s.client == nil {
+		return errors.New("feishu client not configured")
+	}
+	callID := ""
+	if tc != nil {
+		callID = strings.TrimSpace(tc.CallID)
+	}
+	if p.Status != channel.ToolCallStatusRunning && callID != "" {
+		if existing, ok := s.lookupToolCallMessage(callID); ok {
+			patchErr := s.patchToolCallCard(ctx, existing, text)
+			if patchErr == nil {
+				s.forgetToolCallMessage(callID)
+				return nil
+			}
+			if s.adapter != nil && s.adapter.logger != nil {
+				s.adapter.logger.WarnContext(ctx, "feishu: tool-call end patch failed, falling back to new card",
+					slog.String("call_id", callID),
+					slog.Any("error", patchErr),
+				)
+			}
+			s.forgetToolCallMessage(callID)
+		}
+	}
+	msgID, err := s.sendToolCallCard(ctx, text)
+	if err != nil {
+		return err
+	}
+	if p.Status == channel.ToolCallStatusRunning && callID != "" && msgID != "" {
+		s.storeToolCallMessage(callID, msgID)
+	}
+	return nil
+}
+
+func (s *feishuOutboundStream) patchToolCallCard(ctx context.Context, messageID, text string) error {
+	content, err := buildFeishuCardContent(text)
+	if err != nil {
+		return err
+	}
+	patchReq := larkim.NewPatchMessageReqBuilder().
+		MessageId(messageID).
+		Body(larkim.NewPatchMessageReqBodyBuilder().
+			Content(content).
+			Build()).
+		Build()
+	patchResp, err := s.client.Im.Message.Patch(ctx, patchReq)
+	if err != nil {
+		return err
+	}
+	if patchResp == nil || !patchResp.Success() {
+		code, msg := 0, ""
+		if patchResp != nil {
+			code, msg = patchResp.Code, patchResp.Msg
+		}
+		return fmt.Errorf("feishu tool card patch failed: %s (code: %d)", msg, code)
+	}
+	return nil
+}
+
+func (s *feishuOutboundStream) lookupToolCallMessage(callID string) (string, bool) {
+	if s.toolMessages == nil {
+		return "", false
+	}
+	m, ok := s.toolMessages[callID]
+	return m, ok
+}
+
+func (s *feishuOutboundStream) storeToolCallMessage(callID, messageID string) {
+	if s.toolMessages == nil {
+		s.toolMessages = make(map[string]string)
+	}
+	s.toolMessages[callID] = messageID
+}
+
+func (s *feishuOutboundStream) forgetToolCallMessage(callID string) {
+	if s.toolMessages == nil {
+		return
+	}
+	delete(s.toolMessages, callID)
+}
+
+func (s *feishuOutboundStream) sendToolCallCard(ctx context.Context, text string) (string, error) {
+	content, err := buildFeishuCardContent(text)
 	if err != nil {
 		return "", err
 	}
-	return string(data), nil
-}
-
-var feishuCardHeadingPrefix = regexp.MustCompile(`(?m)^#{1,6}\s+(.+)$`)
-
-// processFeishuCardMarkdown normalizes markdown for Feishu card lark_md (e.g. ATX headings to bold).
-func processFeishuCardMarkdown(s string) string {
-	s = strings.ReplaceAll(s, "\\n", "\n")
-	s = feishuCardHeadingPrefix.ReplaceAllStringFunc(s, func(m string) string {
-		parts := feishuCardHeadingPrefix.FindStringSubmatch(m)
-		if len(parts) == 2 {
-			return "**" + parts[1] + "**"
+	if s.reply != nil && strings.TrimSpace(s.reply.MessageID) != "" {
+		replyReq := larkim.NewReplyMessageReqBuilder().
+			MessageId(strings.TrimSpace(s.reply.MessageID)).
+			Body(larkim.NewReplyMessageReqBodyBuilder().
+				Content(content).
+				MsgType(larkim.MsgTypeInteractive).
+				Uuid(uuid.NewString()).
+				Build()).
+			Build()
+		replyResp, err := s.client.Im.Message.Reply(ctx, replyReq)
+		if err != nil {
+			return "", err
 		}
-		return m
-	})
-	return s
+		if replyResp == nil || !replyResp.Success() {
+			code, msg := 0, ""
+			if replyResp != nil {
+				code, msg = replyResp.Code, replyResp.Msg
+			}
+			return "", fmt.Errorf("feishu tool card reply failed: %s (code: %d)", msg, code)
+		}
+		if replyResp.Data == nil || replyResp.Data.MessageId == nil {
+			return "", nil
+		}
+		return strings.TrimSpace(*replyResp.Data.MessageId), nil
+	}
+	createReq := larkim.NewCreateMessageReqBuilder().
+		ReceiveIdType(s.receiveType).
+		Body(larkim.NewCreateMessageReqBodyBuilder().
+			ReceiveId(s.receiveID).
+			MsgType(larkim.MsgTypeInteractive).
+			Content(content).
+			Uuid(uuid.NewString()).
+			Build()).
+		Build()
+	createResp, err := s.client.Im.Message.Create(ctx, createReq)
+	if err != nil {
+		return "", err
+	}
+	if createResp == nil || !createResp.Success() {
+		code, msg := 0, ""
+		if createResp != nil {
+			code, msg = createResp.Code, createResp.Msg
+		}
+		return "", fmt.Errorf("feishu tool card create failed: %s (code: %d)", msg, code)
+	}
+	if createResp.Data == nil || createResp.Data.MessageId == nil {
+		return "", nil
+	}
+	return strings.TrimSpace(*createResp.Data.MessageId), nil
 }
 
 func normalizeFeishuStreamText(text string) string {

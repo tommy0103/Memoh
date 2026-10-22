@@ -2,13 +2,13 @@ package local
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"sync"
 	"sync/atomic"
 
 	"github.com/google/uuid"
 
-	"github.com/memohai/memoh/internal/channel"
+	"github.com/felinics/memoh/internal/channel"
 )
 
 // RouteHubEvent is a routed outbound stream event for local transports.
@@ -98,26 +98,26 @@ type localOutboundStream struct {
 	closed atomic.Bool
 }
 
-func newLocalOutboundStream(hub *RouteHub, target string) channel.OutboundStream {
+func newLocalOutboundStream(hub *RouteHub, target string) channel.PreparedOutboundStream {
 	return &localOutboundStream{
 		hub:    hub,
 		target: target,
 	}
 }
 
-func (s *localOutboundStream) Push(ctx context.Context, event channel.StreamEvent) error {
+func (s *localOutboundStream) Push(ctx context.Context, event channel.PreparedStreamEvent) error {
 	if s == nil || s.hub == nil {
-		return fmt.Errorf("route hub not configured")
+		return errors.New("route hub not configured")
 	}
 	if s.closed.Load() {
-		return fmt.Errorf("stream is closed")
+		return errors.New("stream is closed")
 	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
 	}
-	s.hub.PublishEvent(s.target, event)
+	s.hub.PublishEvent(s.target, event.LogicalEvent())
 	return nil
 }
 

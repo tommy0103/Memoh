@@ -2,6 +2,7 @@ package channel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -26,11 +27,11 @@ func NewRegistry() *Registry {
 // Register adds an adapter to the registry.
 func (r *Registry) Register(adapter Adapter) error {
 	if adapter == nil {
-		return fmt.Errorf("adapter is nil")
+		return errors.New("adapter is nil")
 	}
 	ct := normalizeChannelType(adapter.Type().String())
 	if ct == "" {
-		return fmt.Errorf("channel type is required")
+		return errors.New("channel type is required")
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -148,6 +149,45 @@ func (r *Registry) GetCapabilities(channelType ChannelType) (ChannelCapabilities
 	return desc.Capabilities, true
 }
 
+// GetOutboundCapabilities returns capabilities refined for one outbound target.
+func (r *Registry) GetOutboundCapabilities(channelType ChannelType, cfg ChannelConfig, target string) (ChannelCapabilities, bool) {
+	desc, ok := r.GetDescriptor(channelType)
+	if !ok {
+		return ChannelCapabilities{}, false
+	}
+	caps := desc.Capabilities
+	adapter, ok := r.Get(channelType)
+	if !ok {
+		return caps, true
+	}
+	if resolver, ok := adapter.(OutboundCapabilityResolver); ok {
+		caps = resolver.ResolveOutboundCapabilities(cfg, target, caps)
+	}
+	return caps, true
+}
+
+// ResolveOutboundTarget resolves runtime delivery aliases before outbound
+// capability checks and adapter dispatch.
+func (r *Registry) ResolveOutboundTarget(ctx context.Context, channelType ChannelType, cfg ChannelConfig, target string) (string, bool, error) {
+	adapter, ok := r.Get(channelType)
+	if !ok {
+		return strings.TrimSpace(target), false, nil
+	}
+	resolver, ok := adapter.(OutboundTargetResolver)
+	if !ok {
+		return strings.TrimSpace(target), false, nil
+	}
+	resolved, err := resolver.ResolveOutboundTarget(ctx, cfg, target)
+	if err != nil {
+		return "", true, err
+	}
+	resolved = strings.TrimSpace(resolved)
+	if resolved == "" {
+		return "", true, errors.New("resolved outbound target is empty")
+	}
+	return resolved, true, nil
+}
+
 // GetOutboundPolicy returns the outbound policy for the given channel type.
 func (r *Registry) GetOutboundPolicy(channelType ChannelType) (OutboundPolicy, bool) {
 	desc, ok := r.GetDescriptor(channelType)
@@ -182,6 +222,16 @@ func (r *Registry) IsConfigless(channelType ChannelType) bool {
 		return false
 	}
 	return desc.Configless
+}
+
+// IsOwnerOnly reports whether the given channel type is owner-only: no third
+// party can ever become a sender there (see Descriptor.OwnerOnly).
+func (r *Registry) IsOwnerOnly(channelType ChannelType) bool {
+	desc, ok := r.GetDescriptor(channelType)
+	if !ok {
+		return false
+	}
+	return desc.OwnerOnly
 }
 
 // --- Sender / Receiver accessors ---
@@ -236,6 +286,16 @@ func (r *Registry) GetReceiver(channelType ChannelType) (Receiver, bool) {
 	return receiver, ok
 }
 
+// GetWebhookReceiver returns the WebhookReceiver for the given channel type, or nil if unsupported.
+func (r *Registry) GetWebhookReceiver(channelType ChannelType) (WebhookReceiver, bool) {
+	adapter, ok := r.Get(channelType)
+	if !ok {
+		return nil, false
+	}
+	receiver, ok := adapter.(WebhookReceiver)
+	return receiver, ok
+}
+
 // GetProcessingStatusNotifier returns the ProcessingStatusNotifier for the given channel type, or nil if unsupported.
 func (r *Registry) GetProcessingStatusNotifier(channelType ChannelType) (ProcessingStatusNotifier, bool) {
 	adapter, ok := r.Get(channelType)
@@ -268,6 +328,32 @@ func (r *Registry) DiscoverSelf(ctx context.Context, channelType ChannelType, cr
 		return nil, "", nil
 	}
 	return discoverer.DiscoverSelf(ctx, credentials)
+}
+
+// SelfIdentityPolicy returns adapter-specific persistence requirements for
+// discovered platform bot identity. Most adapters use the zero-value best-effort
+// policy; webhook adapters that cannot route safely without self identity can
+// opt into stricter enable-time validation.
+func (r *Registry) SelfIdentityPolicy(channelType ChannelType) SelfIdentityPolicy {
+	adapter, ok := r.Get(channelType)
+	if !ok {
+		return SelfIdentityPolicy{}
+	}
+	provider, ok := adapter.(SelfIdentityPolicyProvider)
+	if !ok {
+		return SelfIdentityPolicy{}
+	}
+	return provider.SelfIdentityPolicy()
+}
+
+// GetWebhookEndpointSetter returns the platform webhook endpoint setter for the given channel.
+func (r *Registry) GetWebhookEndpointSetter(channelType ChannelType) (WebhookEndpointSetter, bool) {
+	adapter, ok := r.Get(channelType)
+	if !ok {
+		return nil, false
+	}
+	setter, ok := adapter.(WebhookEndpointSetter)
+	return setter, ok
 }
 
 // --- Dispatch methods (replace former global functions in config.go / target.go) ---

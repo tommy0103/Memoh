@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/memohai/memoh/internal/channel"
+	"github.com/felinics/memoh/internal/channel"
 )
 
 // TestFeishuGateway_Integration runs Feishu channel integration test.
@@ -48,7 +48,6 @@ func TestFeishuGateway_Integration(t *testing.T) {
 	handler := func(ctx context.Context, c channel.ChannelConfig, msg channel.InboundMessage) error {
 		plainText := msg.Message.PlainText()
 		logger.Info("received message in test",
-			slog.String("text", plainText),
 			slog.String("user_id", msg.Sender.Attribute("user_id")),
 			slog.String("route_key", msg.RoutingKey()))
 
@@ -64,7 +63,12 @@ func TestFeishuGateway_Integration(t *testing.T) {
 			},
 		}
 
-		if err := adapter.Send(ctx, c, reply); err != nil {
+		if err := adapter.Send(ctx, c, channel.PreparedOutboundMessage{
+			Target: reply.Target,
+			Message: channel.PreparedMessage{
+				Message: reply.Message,
+			},
+		}); err != nil {
 			return fmt.Errorf("failed to send reply: %w", err)
 		}
 
@@ -76,7 +80,14 @@ func TestFeishuGateway_Integration(t *testing.T) {
 					Text: "【Memoh 集成测试】主动推送验证成功。",
 				},
 			}
-			_ = adapter.Send(context.Background(), c, pushMsg)
+			pushCtx, pushCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer pushCancel()
+			_ = adapter.Send(pushCtx, c, channel.PreparedOutboundMessage{
+				Target: pushMsg.Target,
+				Message: channel.PreparedMessage{
+					Message: pushMsg.Message,
+				},
+			})
 		}()
 
 		return nil
@@ -97,8 +108,8 @@ func TestFeishuGateway_Integration(t *testing.T) {
 	fmt.Println("==================================================================")
 
 	select {
-	case msg := <-receivedChan:
-		logger.Info("integration test passed", slog.String("received_text", msg.Message.PlainText()))
+	case <-receivedChan:
+		logger.Info("integration test passed")
 		time.Sleep(2 * time.Second)
 	case <-ctx.Done():
 		if ctx.Err() == context.DeadlineExceeded {

@@ -3,25 +3,32 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 	"time"
 
-	"github.com/memohai/memoh/internal/db"
-	"github.com/memohai/memoh/internal/db/sqlc"
+	"github.com/felinics/memoh/internal/db"
+	"github.com/felinics/memoh/internal/db/postgres/sqlc"
+	dbstore "github.com/felinics/memoh/internal/db/store"
 )
 
 // Connection represents a stored MCP connection for a bot.
 type Connection struct {
-	ID        string         `json:"id"`
-	BotID     string         `json:"bot_id"`
-	Name      string         `json:"name"`
-	Type      string         `json:"type"`
-	Config    map[string]any `json:"config"`
-	Active    bool           `json:"is_active"`
-	CreatedAt time.Time      `json:"created_at"`
-	UpdatedAt time.Time      `json:"updated_at"`
+	ID            string           `json:"id"`
+	BotID         string           `json:"bot_id"`
+	Name          string           `json:"name"`
+	Type          string           `json:"type"`
+	Config        map[string]any   `json:"config"`
+	Active        bool             `json:"is_active"`
+	Status        string           `json:"status"`
+	ToolsCache    []ToolDescriptor `json:"tools_cache"`
+	LastProbedAt  *time.Time       `json:"last_probed_at,omitempty"`
+	StatusMessage string           `json:"status_message"`
+	AuthType      string           `json:"auth_type"`
+	CreatedAt     time.Time        `json:"created_at"`
+	UpdatedAt     time.Time        `json:"updated_at"`
 }
 
 // UpsertRequest accepts standard mcpServers item format.
@@ -36,6 +43,7 @@ type UpsertRequest struct {
 	Headers   map[string]string `json:"headers,omitempty"`
 	Transport string            `json:"transport,omitempty"`
 	Active    *bool             `json:"is_active,omitempty"`
+	AuthType  string            `json:"auth_type,omitempty"`
 }
 
 // ImportRequest accepts a standard mcpServers dict for batch import.
@@ -66,12 +74,12 @@ type ExportResponse struct {
 
 // ConnectionService handles CRUD operations for MCP connections.
 type ConnectionService struct {
-	queries *sqlc.Queries
+	queries dbstore.Queries
 	logger  *slog.Logger
 }
 
 // NewConnectionService creates a ConnectionService backed by sqlc queries.
-func NewConnectionService(log *slog.Logger, queries *sqlc.Queries) *ConnectionService {
+func NewConnectionService(log *slog.Logger, queries dbstore.Queries) *ConnectionService {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -84,7 +92,7 @@ func NewConnectionService(log *slog.Logger, queries *sqlc.Queries) *ConnectionSe
 // ListByBot returns all MCP connections for a bot.
 func (s *ConnectionService) ListByBot(ctx context.Context, botID string) ([]Connection, error) {
 	if s.queries == nil {
-		return nil, fmt.Errorf("mcp queries not configured")
+		return nil, errors.New("mcp queries not configured")
 	}
 	pgBotID, err := db.ParseUUID(botID)
 	if err != nil {
@@ -123,7 +131,7 @@ func (s *ConnectionService) ListActiveByBot(ctx context.Context, botID string) (
 // Get returns a specific MCP connection for a bot.
 func (s *ConnectionService) Get(ctx context.Context, botID, id string) (Connection, error) {
 	if s.queries == nil {
-		return Connection{}, fmt.Errorf("mcp queries not configured")
+		return Connection{}, errors.New("mcp queries not configured")
 	}
 	pgBotID, err := db.ParseUUID(botID)
 	if err != nil {
@@ -146,7 +154,7 @@ func (s *ConnectionService) Get(ctx context.Context, botID, id string) (Connecti
 // Create inserts a new MCP connection for a bot.
 func (s *ConnectionService) Create(ctx context.Context, botID string, req UpsertRequest) (Connection, error) {
 	if s.queries == nil {
-		return Connection{}, fmt.Errorf("mcp queries not configured")
+		return Connection{}, errors.New("mcp queries not configured")
 	}
 	botUUID, err := db.ParseUUID(botID)
 	if err != nil {
@@ -154,7 +162,7 @@ func (s *ConnectionService) Create(ctx context.Context, botID string, req Upsert
 	}
 	name := strings.TrimSpace(req.Name)
 	if name == "" {
-		return Connection{}, fmt.Errorf("name is required")
+		return Connection{}, ErrNameRequired
 	}
 	mcpType, config, err := inferTypeAndConfig(req)
 	if err != nil {
@@ -168,14 +176,22 @@ func (s *ConnectionService) Create(ctx context.Context, botID string, req Upsert
 	if req.Active != nil {
 		active = *req.Active
 	}
+	authType := strings.TrimSpace(req.AuthType)
+	if authType == "" {
+		authType = "none"
+	}
 	row, err := s.queries.CreateMCPConnection(ctx, sqlc.CreateMCPConnectionParams{
 		BotID:    botUUID,
 		Name:     name,
 		Type:     mcpType,
 		Config:   configPayload,
 		IsActive: active,
+		AuthType: authType,
 	})
 	if err != nil {
+		if db.IsUniqueViolation(err) {
+			return Connection{}, fmt.Errorf("%w: %w", ErrNameTaken, err)
+		}
 		return Connection{}, err
 	}
 	return normalizeMCPConnection(row)
@@ -184,7 +200,7 @@ func (s *ConnectionService) Create(ctx context.Context, botID string, req Upsert
 // Update modifies an existing MCP connection.
 func (s *ConnectionService) Update(ctx context.Context, botID, id string, req UpsertRequest) (Connection, error) {
 	if s.queries == nil {
-		return Connection{}, fmt.Errorf("mcp queries not configured")
+		return Connection{}, errors.New("mcp queries not configured")
 	}
 	botUUID, err := db.ParseUUID(botID)
 	if err != nil {
@@ -196,7 +212,7 @@ func (s *ConnectionService) Update(ctx context.Context, botID, id string, req Up
 	}
 	name := strings.TrimSpace(req.Name)
 	if name == "" {
-		return Connection{}, fmt.Errorf("name is required")
+		return Connection{}, ErrNameRequired
 	}
 	mcpType, config, err := inferTypeAndConfig(req)
 	if err != nil {
@@ -205,6 +221,37 @@ func (s *ConnectionService) Update(ctx context.Context, botID, id string, req Up
 	active := true
 	if req.Active != nil {
 		active = *req.Active
+	}
+	authType := strings.TrimSpace(req.AuthType)
+	if authType == "" {
+		// Upsert payloads never carry auth_type — that field is owned by the
+		// OAuth flow. Defaulting an omitted value to "none" would silently
+		// strip OAuth on every save/toggle, so preserve the stored value —
+		// but ONLY within the credential's scope. The scope is the RFC 8707
+		// resource the token was minted for — origin AND path, compared
+		// through canonicalResourceURI — because the path is baked into the
+		// token's audience: a token minted for /mcp fails audience checks on
+		// /v2/mcp, so a same-origin path edit is still out of scope.
+		// Editing out of scope (other origin, other path, or stdio) falls
+		// back to "none" AND clears the stored credential: keeping it would
+		// leave GetStatus reporting has_token=true while requests go out
+		// anonymous. Clearing mirrors RevokeToken — the client registration
+		// survives, only the grant is dropped — so the UI and the wire agree
+		// that re-authorization is needed. Clear BEFORE the row update: if
+		// the update then fails, the safe side is a dropped grant, never a
+		// credential attached to a target it was not minted for.
+		if existing, getErr := s.Get(ctx, botID, id); getErr == nil {
+			if sameOAuthResource(existing, config) {
+				authType = strings.TrimSpace(existing.AuthType)
+			} else if existing.AuthType == "oauth" {
+				if err := s.queries.ClearMCPOAuthTokens(ctx, connUUID); err != nil {
+					return Connection{}, fmt.Errorf("clear oauth tokens on scope change: %w", err)
+				}
+			}
+		}
+	}
+	if authType == "" {
+		authType = "none"
 	}
 	configPayload, err := json.Marshal(config)
 	if err != nil {
@@ -217,8 +264,12 @@ func (s *ConnectionService) Update(ctx context.Context, botID, id string, req Up
 		Type:     mcpType,
 		Config:   configPayload,
 		IsActive: active,
+		AuthType: authType,
 	})
 	if err != nil {
+		if db.IsUniqueViolation(err) {
+			return Connection{}, fmt.Errorf("%w: %w", ErrNameTaken, err)
+		}
 		return Connection{}, err
 	}
 	return normalizeMCPConnection(row)
@@ -230,7 +281,7 @@ func (s *ConnectionService) Update(ctx context.Context, botID, id string, req Up
 // Connections not in the input are left untouched.
 func (s *ConnectionService) Import(ctx context.Context, botID string, req ImportRequest) ([]Connection, error) {
 	if s.queries == nil {
-		return nil, fmt.Errorf("mcp queries not configured")
+		return nil, errors.New("mcp queries not configured")
 	}
 	botUUID, err := db.ParseUUID(botID)
 	if err != nil {
@@ -248,7 +299,7 @@ func (s *ConnectionService) Import(ctx context.Context, botID string, req Import
 		upsert := entryToUpsertRequest(name, entry)
 		mcpType, config, err := inferTypeAndConfig(upsert)
 		if err != nil {
-			return nil, fmt.Errorf("server %q: %w", name, err)
+			return nil, &ServerError{Name: name, Err: err}
 		}
 		configPayload, err := json.Marshal(config)
 		if err != nil {
@@ -288,7 +339,7 @@ func (s *ConnectionService) ExportByBot(ctx context.Context, botID string) (Expo
 // Delete removes an MCP connection.
 func (s *ConnectionService) Delete(ctx context.Context, botID, id string) error {
 	if s.queries == nil {
-		return fmt.Errorf("mcp queries not configured")
+		return errors.New("mcp queries not configured")
 	}
 	botUUID, err := db.ParseUUID(botID)
 	if err != nil {
@@ -307,7 +358,7 @@ func (s *ConnectionService) Delete(ctx context.Context, botID, id string) error 
 // BatchDelete removes multiple MCP connections by IDs. Invalid IDs are skipped; at least one must succeed for no error.
 func (s *ConnectionService) BatchDelete(ctx context.Context, botID string, ids []string) error {
 	if s.queries == nil {
-		return fmt.Errorf("mcp queries not configured")
+		return errors.New("mcp queries not configured")
 	}
 	if len(ids) == 0 {
 		return nil
@@ -330,16 +381,64 @@ func normalizeMCPConnection(row sqlc.McpConnection) (Connection, error) {
 	if err != nil {
 		return Connection{}, err
 	}
+	toolsCache, _ := decodeToolsCache(row.ToolsCache)
+	var lastProbedAt *time.Time
+	if row.LastProbedAt.Valid {
+		t := db.TimeFromPg(row.LastProbedAt)
+		lastProbedAt = &t
+	}
 	return Connection{
-		ID:        row.ID.String(),
-		BotID:     row.BotID.String(),
-		Name:      strings.TrimSpace(row.Name),
-		Type:      strings.TrimSpace(row.Type),
-		Config:    config,
-		Active:    row.IsActive,
-		CreatedAt: db.TimeFromPg(row.CreatedAt),
-		UpdatedAt: db.TimeFromPg(row.UpdatedAt),
+		ID:            row.ID.String(),
+		BotID:         row.BotID.String(),
+		Name:          strings.TrimSpace(row.Name),
+		Type:          strings.TrimSpace(row.Type),
+		Config:        config,
+		Active:        row.IsActive,
+		Status:        strings.TrimSpace(row.Status),
+		ToolsCache:    toolsCache,
+		LastProbedAt:  lastProbedAt,
+		StatusMessage: strings.TrimSpace(row.StatusMessage),
+		AuthType:      strings.TrimSpace(row.AuthType),
+		CreatedAt:     db.TimeFromPg(row.CreatedAt),
+		UpdatedAt:     db.TimeFromPg(row.UpdatedAt),
 	}, nil
+}
+
+func decodeToolsCache(raw []byte) ([]ToolDescriptor, error) {
+	if len(raw) == 0 {
+		return []ToolDescriptor{}, nil
+	}
+	var tools []ToolDescriptor
+	if err := json.Unmarshal(raw, &tools); err != nil {
+		return []ToolDescriptor{}, nil
+	}
+	return tools, nil
+}
+
+// UpdateProbeResult persists the result of a probe operation.
+func (s *ConnectionService) UpdateProbeResult(ctx context.Context, botID, id, status string, tools []ToolDescriptor, message string) error {
+	if s.queries == nil {
+		return errors.New("mcp queries not configured")
+	}
+	pgBotID, err := db.ParseUUID(botID)
+	if err != nil {
+		return err
+	}
+	pgID, err := db.ParseUUID(id)
+	if err != nil {
+		return err
+	}
+	toolsPayload, err := json.Marshal(tools)
+	if err != nil {
+		return err
+	}
+	return s.queries.UpdateMCPConnectionProbeResult(ctx, sqlc.UpdateMCPConnectionProbeResultParams{
+		BotID:         pgBotID,
+		ID:            pgID,
+		Status:        status,
+		ToolsCache:    toolsPayload,
+		StatusMessage: message,
+	})
 }
 
 func decodeMCPConfig(raw []byte) (map[string]any, error) {
@@ -356,16 +455,33 @@ func decodeMCPConfig(raw []byte) (map[string]any, error) {
 	return payload, nil
 }
 
+// sameOAuthResource reports whether an existing connection and a new config
+// are both remote and address the same OAuth resource — compared through
+// canonicalResourceURI (origin AND path), the same form the token's RFC 8707
+// resource is stored in. Any parse failure, missing URL, or type mismatch
+// counts as "different" — the safe side.
+func sameOAuthResource(existing Connection, newConfig map[string]any) bool {
+	if existing.Type == "stdio" {
+		return false
+	}
+	oldURL, _ := existing.Config["url"].(string)
+	newURL, _ := newConfig["url"].(string)
+	if strings.TrimSpace(oldURL) == "" || strings.TrimSpace(newURL) == "" {
+		return false
+	}
+	return canonicalResourceURI(oldURL) == canonicalResourceURI(newURL)
+}
+
 // inferTypeAndConfig builds internal type + config from a standard mcpServers item.
 func inferTypeAndConfig(req UpsertRequest) (string, map[string]any, error) {
 	hasCommand := strings.TrimSpace(req.Command) != ""
 	hasURL := strings.TrimSpace(req.URL) != ""
 
 	if !hasCommand && !hasURL {
-		return "", nil, fmt.Errorf("command or url is required")
+		return "", nil, fmt.Errorf("%w: command or url is required", ErrEndpointInvalid)
 	}
 	if hasCommand && hasURL {
-		return "", nil, fmt.Errorf("command and url are mutually exclusive")
+		return "", nil, fmt.Errorf("%w: command and url are mutually exclusive", ErrEndpointInvalid)
 	}
 
 	config := map[string]any{}

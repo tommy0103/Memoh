@@ -9,7 +9,7 @@ import (
 
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
-	"github.com/memohai/memoh/internal/channel"
+	"github.com/felinics/memoh/internal/channel"
 )
 
 type fakeProcessingReactionGateway struct {
@@ -22,7 +22,7 @@ type fakeProcessingReactionGateway struct {
 	removeErr error
 }
 
-func (g *fakeProcessingReactionGateway) Add(ctx context.Context, messageID, reactionType string) (string, error) {
+func (g *fakeProcessingReactionGateway) Add(_ context.Context, messageID, reactionType string) (string, error) {
 	g.addCalls = append(g.addCalls, struct{ messageID, reactionType string }{
 		messageID:    messageID,
 		reactionType: reactionType,
@@ -35,7 +35,7 @@ func (g *fakeProcessingReactionGateway) Add(ctx context.Context, messageID, reac
 	return resp.reactionID, resp.err
 }
 
-func (g *fakeProcessingReactionGateway) Remove(ctx context.Context, messageID, reactionID string) error {
+func (g *fakeProcessingReactionGateway) Remove(_ context.Context, messageID, reactionID string) error {
 	g.removeCalls = append(g.removeCalls, struct{ messageID, reactionID string }{
 		messageID:  messageID,
 		reactionID: reactionID,
@@ -207,16 +207,50 @@ func TestExtractFeishuInboundImageAttachmentReference(t *testing.T) {
 	}
 }
 
+func TestExtractFeishuInboundFileAttachmentInfersVideoType(t *testing.T) {
+	t.Parallel()
+
+	content := `{"file_key":"file_1","file_name":"clip.mp4","mime_type":"video/mp4"}`
+	msgType := larkim.MsgTypeFile
+	event := &larkim.P2MessageReceiveV1{
+		Event: &larkim.P2MessageReceiveV1Data{
+			Message: &larkim.EventMessage{
+				MessageType: &msgType,
+				Content:     &content,
+			},
+		},
+	}
+	got := extractFeishuInbound(event, "")
+	if len(got.Message.Attachments) != 1 {
+		t.Fatalf("expected one attachment, got %d", len(got.Message.Attachments))
+	}
+	att := got.Message.Attachments[0]
+	if att.Type != channel.AttachmentVideo {
+		t.Fatalf("expected inferred video type, got %s", att.Type)
+	}
+	if att.Mime != "video/mp4" {
+		t.Fatalf("expected normalized mime video/mp4, got %s", att.Mime)
+	}
+}
+
 func TestFeishuDescriptorIncludesStreamingAndMedia(t *testing.T) {
 	t.Parallel()
 
 	adapter := NewFeishuAdapter(nil)
-	caps := adapter.Descriptor().Capabilities
+	desc := adapter.Descriptor()
+	caps := desc.Capabilities
 	if !caps.Streaming {
 		t.Fatal("expected streaming capability")
 	}
 	if !caps.Media {
 		t.Fatal("expected media capability")
+	}
+	if !caps.Markdown {
+		t.Fatal("expected markdown capability for card markdown rendering")
+	}
+	policy := channel.NormalizeOutboundPolicy(desc.OutboundPolicy)
+	if policy.RichTextChunkLimit != feishuStreamMaxRunes {
+		t.Fatalf("RichTextChunkLimit = %d, want %d", policy.RichTextChunkLimit, feishuStreamMaxRunes)
 	}
 }
 
@@ -268,6 +302,34 @@ func TestIsFeishuImageAttachment(t *testing.T) {
 	}
 }
 
+func TestResolveFeishuFileType(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		file string
+		mime string
+		want string
+	}{
+		{name: "video mime", file: "clip.bin", mime: "video/mp4", want: larkim.CreateFileFileTypeMp4},
+		{name: "pdf mime", file: "doc.bin", mime: "application/pdf", want: larkim.CreateFileFileTypePdf},
+		{name: "doc ext", file: "a.docx", mime: "application/octet-stream", want: larkim.CreateFileFileTypeDoc},
+		{name: "xls ext", file: "a.xlsx", mime: "application/octet-stream", want: larkim.CreateFileFileTypeXls},
+		{name: "ppt ext", file: "a.pptx", mime: "application/octet-stream", want: larkim.CreateFileFileTypePpt},
+		{name: "zip mime", file: "a.bin", mime: "application/zip", want: larkim.CreateFileFileTypeStream},
+		{name: "tar gz ext", file: "backup.tar.gz", mime: "application/octet-stream", want: larkim.CreateFileFileTypeStream},
+		{name: "default stream", file: "notes.txt", mime: "text/plain", want: larkim.CreateFileFileTypeStream},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := resolveFeishuFileType(tc.file, tc.mime); got != tc.want {
+				t.Fatalf("resolveFeishuFileType(%q,%q)=%q want=%q", tc.file, tc.mime, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestBuildFeishuStreamCardContent(t *testing.T) {
 	t.Parallel()
 
@@ -304,6 +366,108 @@ func TestBuildFeishuStreamCardContentWithState(t *testing.T) {
 	}
 }
 
+func TestBuildFeishuOutboundContentPlainTextKeepsInteractiveCard(t *testing.T) {
+	t.Parallel()
+
+	msgType, content, err := buildFeishuOutboundContent(channel.Message{Text: "你好 **bold**"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if msgType != larkim.MsgTypeInteractive {
+		t.Fatalf("msg type = %q, want %q", msgType, larkim.MsgTypeInteractive)
+	}
+	if !strings.Contains(content, "你好 **bold**") {
+		t.Fatalf("expected interactive card content to preserve plain text, got %s", content)
+	}
+}
+
+func TestBuildFeishuOutboundContentPlainFormatUsesPlainTextCard(t *testing.T) {
+	t.Parallel()
+
+	raw := `literal **bold** [x](https://example.com) <at user_id="ou_123"></at>`
+	msgType, content, err := buildFeishuOutboundContent(channel.Message{
+		Text:   raw,
+		Format: channel.MessageFormatPlain,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if msgType != larkim.MsgTypeInteractive {
+		t.Fatalf("msg type = %q, want %q", msgType, larkim.MsgTypeInteractive)
+	}
+	text := decodeFeishuCardTextObject(t, content)
+	if text["tag"] != "plain_text" {
+		t.Fatalf("plain format should use plain_text, got %#v", text)
+	}
+	if text["content"] != raw {
+		t.Fatalf("plain card content = %q, want %q", text["content"], raw)
+	}
+}
+
+func TestBuildFeishuOutboundContentRichPartsUsesInteractiveCard(t *testing.T) {
+	t.Parallel()
+
+	msgType, content, err := buildFeishuOutboundContent(channel.Message{
+		Parts: []channel.MessagePart{
+			{Type: channel.MessagePartText, Text: "bold", Styles: []channel.MessageTextStyle{channel.MessageStyleBold}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if msgType != larkim.MsgTypeInteractive {
+		t.Fatalf("msg type = %q, want %q", msgType, larkim.MsgTypeInteractive)
+	}
+	if !strings.Contains(content, `"tag":"markdown"`) || !strings.Contains(content, "**bold**") {
+		t.Fatalf("expected interactive card markdown content, got %s", content)
+	}
+}
+
+func decodeFeishuCardTextObject(t *testing.T, content string) map[string]any {
+	t.Helper()
+
+	var card struct {
+		Body struct {
+			Elements []struct {
+				Text map[string]any `json:"text"`
+			} `json:"elements"`
+		} `json:"body"`
+	}
+	if err := json.Unmarshal([]byte(content), &card); err != nil {
+		t.Fatalf("content is not json: %v", err)
+	}
+	if len(card.Body.Elements) == 0 || card.Body.Elements[0].Text == nil {
+		t.Fatalf("missing card text object: %s", content)
+	}
+	return card.Body.Elements[0].Text
+}
+
+func TestBuildFeishuOutboundContentLongRichPartsFallsBackToText(t *testing.T) {
+	t.Parallel()
+
+	msgType, content, err := buildFeishuOutboundContent(channel.Message{
+		Parts: []channel.MessagePart{
+			{Type: channel.MessagePartText, Text: strings.Repeat("你", feishuStreamMaxRunes+100), Styles: []channel.MessageTextStyle{channel.MessageStyleBold}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if msgType != larkim.MsgTypeText {
+		t.Fatalf("msg type = %q, want %q", msgType, larkim.MsgTypeText)
+	}
+	var got map[string]string
+	if err := json.Unmarshal([]byte(content), &got); err != nil {
+		t.Fatalf("content is not json: %v", err)
+	}
+	if len([]rune(got["text"])) > feishuStreamMaxRunes+4 {
+		t.Fatalf("text content should be truncated, got len=%d", len([]rune(got["text"])))
+	}
+	if strings.Contains(got["text"], "**") {
+		t.Fatalf("long rich fallback should be plain text, got %q", got["text"][:20])
+	}
+}
+
 func TestNormalizeFeishuStreamText(t *testing.T) {
 	t.Parallel()
 
@@ -317,30 +481,6 @@ func TestNormalizeFeishuStreamText(t *testing.T) {
 	}
 	if !strings.HasPrefix(got, "...\n") {
 		t.Fatalf("expected truncation prefix, got: %s", got[:4])
-	}
-}
-
-func TestProcessFeishuCardMarkdown(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{"literal newline", "a\\nb", "a\nb"},
-		{"atx h1", "# Title", "**Title**"},
-		{"atx h2", "## Section", "**Section**"},
-		{"atx h6", "###### Small", "**Small**"},
-		{"heading with newline", "# Hi\n\nBody", "**Hi**\n\nBody"},
-		{"no heading", "plain **bold**", "plain **bold**"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := processFeishuCardMarkdown(tt.in)
-			if got != tt.want {
-				t.Errorf("processFeishuCardMarkdown() = %q, want %q", got, tt.want)
-			}
-		})
 	}
 }
 
@@ -395,6 +535,67 @@ func TestExtractFeishuInboundMentionBotMatched(t *testing.T) {
 	mentioned, ok := got.Metadata["is_mentioned"].(bool)
 	if !ok || !mentioned {
 		t.Fatalf("expected mention flag when bot is mentioned")
+	}
+	if alias, _ := got.Metadata["bot_alias"].(string); alias != "@open_id:"+botOpenID {
+		t.Fatalf("bot_alias = %q, want current bot mention alias", alias)
+	}
+}
+
+func TestExtractFeishuInboundMentionKeyRewriteAndTargets(t *testing.T) {
+	t.Parallel()
+
+	text := `{"text":"@_user_1 hello @_user_2"}`
+	msgType := larkim.MsgTypeText
+	chatType := "group"
+	chatID := "oc_mention_rewrite"
+
+	openID1 := "ou_user_1"
+	name1 := "Alice"
+	mention1 := larkim.NewMentionEventBuilder().
+		Key("@_user_1").
+		Name(name1).
+		Id(larkim.NewUserIdBuilder().OpenId(openID1).Build()).
+		Build()
+
+	userID2 := "u_user_2"
+	name2 := "Bob"
+	mention2 := larkim.NewMentionEventBuilder().
+		Key("@_user_2").
+		Name(name2).
+		Id(larkim.NewUserIdBuilder().UserId(userID2).Build()).
+		Build()
+
+	event := &larkim.P2MessageReceiveV1{
+		Event: &larkim.P2MessageReceiveV1Data{
+			Message: &larkim.EventMessage{
+				MessageType: &msgType,
+				Content:     &text,
+				ChatType:    &chatType,
+				ChatId:      &chatID,
+				Mentions:    []*larkim.MentionEvent{mention1, mention2},
+			},
+		},
+	}
+
+	got := extractFeishuInbound(event, "ou_bot_123")
+	if got.Message.PlainText() != "@Alice hello @Bob" {
+		t.Fatalf("unexpected rewritten text: %q", got.Message.PlainText())
+	}
+
+	targets, ok := got.Metadata["mentioned_targets"].([]string)
+	if !ok {
+		t.Fatalf("expected mentioned_targets to be []string, got %#v", got.Metadata["mentioned_targets"])
+	}
+	if len(targets) != 2 || targets[0] != "open_id:ou_user_1" || targets[1] != "user_id:u_user_2" {
+		t.Fatalf("unexpected mentioned_targets: %#v", targets)
+	}
+
+	mentions, ok := got.Metadata["mentions"].([]map[string]any)
+	if !ok || len(mentions) != 2 {
+		t.Fatalf("expected mentions metadata with 2 entries, got %#v", got.Metadata["mentions"])
+	}
+	if mentions[0]["target"] != "open_id:ou_user_1" || mentions[1]["target"] != "user_id:u_user_2" {
+		t.Fatalf("unexpected mention targets in metadata: %#v", mentions)
 	}
 }
 
@@ -531,6 +732,38 @@ func TestExtractFeishuInboundPostMentionOtherIgnored(t *testing.T) {
 	got := extractFeishuInbound(event, "ou_bot_123")
 	if mentioned, _ := got.Metadata["is_mentioned"].(bool); mentioned {
 		t.Fatalf("expected no mention for post mentioning other user")
+	}
+}
+
+func TestResolveConfiguredBotOpenIDPrefersSelfIdentity(t *testing.T) {
+	t.Parallel()
+
+	cfg := channel.ChannelConfig{
+		SelfIdentity: map[string]any{
+			"open_id": "ou_self_1",
+		},
+		ExternalIdentity: "open_id:ou_external_1",
+	}
+	if got := resolveConfiguredBotOpenID(cfg); got != "ou_self_1" {
+		t.Fatalf("expected self identity open_id, got %q", got)
+	}
+}
+
+func TestResolveConfiguredBotOpenIDFromExternalIdentity(t *testing.T) {
+	t.Parallel()
+
+	cfg := channel.ChannelConfig{ExternalIdentity: "open_id:ou_external_2"}
+	if got := resolveConfiguredBotOpenID(cfg); got != "ou_external_2" {
+		t.Fatalf("expected external identity open_id, got %q", got)
+	}
+}
+
+func TestResolveConfiguredBotOpenIDIgnoresNonOpenIDExternalIdentity(t *testing.T) {
+	t.Parallel()
+
+	cfg := channel.ChannelConfig{ExternalIdentity: "chat_id:oc_group_1"}
+	if got := resolveConfiguredBotOpenID(cfg); got != "" {
+		t.Fatalf("expected empty open_id for non-open external identity, got %q", got)
 	}
 }
 

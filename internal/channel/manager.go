@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/felinics/memoh/internal/markdownmedia"
 )
 
 // ConfigLister lists channel configs for periodic refresh. Used by connection lifecycle.
@@ -62,6 +64,7 @@ type Manager struct {
 	registry        *Registry
 	service         ManagerStore
 	processor       InboundProcessor
+	attachmentStore OutboundAttachmentStore
 	refreshInterval time.Duration
 	logger          *slog.Logger
 	middlewares     []Middleware
@@ -77,15 +80,48 @@ type Manager struct {
 	connectionMeta map[string]ConnectionStatus
 }
 
+// ManagerOption configures a Manager during construction.
+type ManagerOption func(*Manager)
+
+// WithInboundQueueSize sets the capacity of the inbound message queue.
+// The default is 256. Larger values trade memory for lower drop rate under burst load.
+func WithInboundQueueSize(size int) ManagerOption {
+	return func(m *Manager) {
+		if size > 0 {
+			m.inboundQueue = make(chan inboundTask, size)
+		}
+	}
+}
+
+// WithInboundWorkers sets the number of goroutines that process inbound messages
+// concurrently. The default is 4.
+func WithInboundWorkers(n int) ManagerOption {
+	return func(m *Manager) {
+		if n > 0 {
+			m.inboundWorkers = n
+		}
+	}
+}
+
+// WithRefreshInterval overrides the periodic connection reconcile interval.
+// The default is 5 minutes.
+func WithRefreshInterval(d time.Duration) ManagerOption {
+	return func(m *Manager) {
+		if d > 0 {
+			m.refreshInterval = d
+		}
+	}
+}
+
 // NewManager creates a Manager with the given logger, registry, config store, and inbound processor.
-func NewManager(log *slog.Logger, registry *Registry, service ManagerStore, processor InboundProcessor) *Manager {
+func NewManager(log *slog.Logger, registry *Registry, service ManagerStore, processor InboundProcessor, opts ...ManagerOption) *Manager {
 	if log == nil {
 		log = slog.Default()
 	}
 	if registry == nil {
 		registry = NewRegistry()
 	}
-	return &Manager{
+	m := &Manager{
 		registry:        registry,
 		service:         service,
 		processor:       processor,
@@ -97,6 +133,10 @@ func NewManager(log *slog.Logger, registry *Registry, service ManagerStore, proc
 		inboundQueue:    make(chan inboundTask, 256),
 		inboundWorkers:  4,
 	}
+	for _, opt := range opts {
+		opt(m)
+	}
+	return m
 }
 
 // Registry returns the adapter registry used by this manager.
@@ -107,6 +147,12 @@ func (m *Manager) Registry() *Registry {
 // Use appends middleware to the inbound processing chain.
 func (m *Manager) Use(mw ...Middleware) {
 	m.middlewares = append(m.middlewares, mw...)
+}
+
+// SetAttachmentStore wires the shared outbound attachment store used by the
+// prepared outbound layer.
+func (m *Manager) SetAttachmentStore(store OutboundAttachmentStore) {
+	m.attachmentStore = store
 }
 
 // RegisterAdapter adds an adapter to the registry and logs the registration.
@@ -135,18 +181,16 @@ func (m *Manager) AddAdapter(ctx context.Context, adapter Adapter) {
 
 // RemoveAdapter unregisters an adapter and stops all its active connections.
 func (m *Manager) RemoveAdapter(ctx context.Context, channelType ChannelType) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	m.mu.Lock()
 	for id, entry := range m.connections {
 		if entry != nil && entry.config.ChannelType == channelType {
 			if entry.connection != nil {
 				if err := entry.connection.Stop(ctx); err != nil && !errors.Is(err, ErrStopNotSupported) && m.logger != nil {
-					m.logger.Warn("adapter stop failed", slog.String("config_id", id), slog.Any("error", err))
+					m.logger.WarnContext(ctx, "adapter stop failed", slog.String("config_id", id), slog.Any("error", err))
 				}
 			}
 			delete(m.connections, id)
+			delete(m.connectionMeta, id)
 		}
 	}
 	m.mu.Unlock()
@@ -165,9 +209,9 @@ func (m *Manager) Refresh(ctx context.Context) {
 // Start begins the periodic config refresh loop and inbound worker pool.
 func (m *Manager) Start(ctx context.Context) {
 	if m.logger != nil {
-		m.logger.Info("manager start")
+		m.logger.InfoContext(ctx, "manager start")
 	}
-	m.startInboundWorkers(ctx)
+	m.startInboundWorkers() //nolint:contextcheck // The shared pool intentionally owns a request-independent lifecycle context.
 	go func() {
 		m.refresh(ctx)
 		ticker := time.NewTicker(m.refreshInterval)
@@ -176,7 +220,7 @@ func (m *Manager) Start(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				if m.logger != nil {
-					m.logger.Info("manager stop")
+					m.logger.InfoContext(ctx, "manager stop")
 				}
 				m.stopAll(ctx)
 				return
@@ -187,10 +231,17 @@ func (m *Manager) Start(ctx context.Context) {
 	}()
 }
 
+var (
+	// ErrSendTargetRequired means a send named neither a target nor a channel identity.
+	ErrSendTargetRequired = errors.New("target or channel_identity_id is required")
+	// ErrChannelBindingRequired means the recipient identity has not linked this channel.
+	ErrChannelBindingRequired = errors.New("channel binding required")
+)
+
 // Send delivers an outbound message to the specified channel, resolving target and config automatically.
 func (m *Manager) Send(ctx context.Context, botID string, channelType ChannelType, req SendRequest) error {
 	if m.service == nil {
-		return fmt.Errorf("channel manager not configured")
+		return errors.New("channel manager not configured")
 	}
 	sender, ok := m.registry.GetSender(channelType)
 	if !ok {
@@ -204,52 +255,79 @@ func (m *Manager) Send(ctx context.Context, botID string, channelType ChannelTyp
 	if target == "" {
 		targetChannelIdentityID := strings.TrimSpace(req.ChannelIdentityID)
 		if targetChannelIdentityID == "" {
-			return fmt.Errorf("target or channel_identity_id is required")
+			return ErrSendTargetRequired
 		}
 		userCfg, err := m.service.GetChannelIdentityConfig(ctx, targetChannelIdentityID, channelType)
 		if err != nil {
 			if m.logger != nil {
-				m.logger.Warn("channel binding missing", slog.String("channel", channelType.String()), slog.String("channel_identity_id", targetChannelIdentityID))
+				m.logger.WarnContext(ctx, "channel binding missing", slog.String("channel", channelType.String()), slog.String("channel_identity_id", targetChannelIdentityID))
 			}
-			return fmt.Errorf("channel binding required")
+			return ErrChannelBindingRequired
 		}
 		target, err = m.registry.ResolveTargetFromUserConfig(channelType, userCfg.Config)
 		if err != nil {
 			return err
 		}
 	}
-	if normalized, ok := m.registry.NormalizeTarget(channelType, target); ok {
-		target = normalized
-	}
-	if req.Message.IsEmpty() {
-		return fmt.Errorf("message is required")
-	}
-	if m.logger != nil {
-		m.logger.Info("send outbound", slog.String("channel", channelType.String()), slog.String("bot_id", botID))
-	}
-	policy := m.resolveOutboundPolicy(channelType)
-	outbound, err := buildOutboundMessages(OutboundMessage{
-		Target:  target,
-		Message: req.Message,
-	}, policy)
+	target, err = m.resolveOutboundTarget(ctx, channelType, config, target)
 	if err != nil {
 		return err
 	}
-	for _, item := range outbound {
-		if err := m.sendWithConfig(ctx, sender, config, item, policy); err != nil {
-			if m.logger != nil {
-				m.logger.Error("send outbound failed", slog.String("channel", channelType.String()), slog.String("bot_id", botID), slog.Any("error", err))
-			}
+	if req.ExcludedTarget != "" {
+		excluded, err := m.resolveOutboundTarget(ctx, channelType, config, req.ExcludedTarget)
+		if err != nil {
 			return err
+		}
+		if excluded == target {
+			return errors.New("send to the current conversation is not allowed in chat mode; reply directly")
+		}
+	}
+	if req.Message.IsEmpty() {
+		return errors.New("message is required")
+	}
+	if m.logger != nil {
+		m.logger.InfoContext(ctx, "send outbound", slog.String("channel", channelType.String()), slog.String("bot_id", botID))
+	}
+	policy := m.resolveOutboundPolicy(channelType)
+	caps, hasCaps := m.registry.GetOutboundCapabilities(channelType, config, target)
+	outbound, err := buildOutboundMessagesWithCaps(OutboundMessage{
+		Target:  target,
+		Message: req.Message,
+	}, policy, caps, hasCaps)
+	if err != nil {
+		return err
+	}
+	if err := m.sendAllWithConfig(ctx, sender, config, outbound, policy); err != nil {
+		return err
+	}
+	for _, binding := range markdownmedia.Bindings(req.Message.Metadata) {
+		if binding.ErrorCode != "" || (hasCaps && !caps.Attachments) {
+			return markdownmedia.ErrPartialDelivery
 		}
 	}
 	return nil
 }
 
+func (m *Manager) resolveOutboundTarget(ctx context.Context, channelType ChannelType, cfg ChannelConfig, target string) (string, error) {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return "", errors.New("target is required")
+	}
+	if normalized, ok := m.registry.NormalizeTarget(channelType, target); ok {
+		target = normalized
+	}
+	if resolved, ok, err := m.registry.ResolveOutboundTarget(ctx, channelType, cfg, target); err != nil {
+		return "", err
+	} else if ok {
+		target = resolved
+	}
+	return target, nil
+}
+
 // React adds or removes an emoji reaction on a channel message.
 func (m *Manager) React(ctx context.Context, botID string, channelType ChannelType, req ReactRequest) error {
 	if m.service == nil {
-		return fmt.Errorf("channel manager not configured")
+		return errors.New("channel manager not configured")
 	}
 	reactor, ok := m.registry.GetReactor(channelType)
 	if !ok {
@@ -261,21 +339,21 @@ func (m *Manager) React(ctx context.Context, botID string, channelType ChannelTy
 	}
 	target := strings.TrimSpace(req.Target)
 	if target == "" {
-		return fmt.Errorf("target is required for reactions")
+		return errors.New("target is required for reactions")
 	}
 	if normalized, ok := m.registry.NormalizeTarget(channelType, target); ok {
 		target = normalized
 	}
 	messageID := strings.TrimSpace(req.MessageID)
 	if messageID == "" {
-		return fmt.Errorf("message_id is required for reactions")
+		return errors.New("message_id is required for reactions")
 	}
 	emoji := strings.TrimSpace(req.Emoji)
 	if !req.Remove && emoji == "" {
-		return fmt.Errorf("emoji is required when adding a reaction")
+		return errors.New("emoji is required when adding a reaction")
 	}
 	if m.logger != nil {
-		m.logger.Info("react outbound",
+		m.logger.InfoContext(ctx, "react outbound",
 			slog.String("channel", channelType.String()),
 			slog.String("bot_id", botID),
 			slog.String("message_id", messageID),

@@ -10,6 +10,7 @@ type ChannelCapabilities struct {
 	Media           bool     `json:"media"`
 	Reactions       bool     `json:"reactions"`
 	Buttons         bool     `json:"buttons"`
+	URLButtons      bool     `json:"url_buttons"`
 	Reply           bool     `json:"reply"`
 	Threads         bool     `json:"threads"`
 	Streaming       bool     `json:"streaming"`
@@ -17,6 +18,7 @@ type ChannelCapabilities struct {
 	Edit            bool     `json:"edit"`
 	Unsend          bool     `json:"unsend"`
 	NativeCommands  bool     `json:"native_commands"`
+	NativeUserInput bool     `json:"native_user_input"`
 	BlockStreaming  bool     `json:"block_streaming"`
 	ChatTypes       []string `json:"chat_types,omitempty"`
 }

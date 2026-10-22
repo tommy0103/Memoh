@@ -1,90 +1,126 @@
 <div align="right">
   <span>[<a href="./README.md">English</a>]<span>
   </span>[<a href="./README_CN.md">简体中文</a>]</span>
+  </span>[<a href="./README_JA.md">日本語</a>]</span>
 </div>  
 
 <div align="center">
-  <img src="./assets/logo.png" alt="Memoh" width="100" height="100">
+  <img src="./assets/logo.png" alt="Memoh" height="80">
   <h1>Memoh</h1>
-  <p>多用户、结构化记忆、容器化的 AI Agent 系统。</p>
-  <p>📌 <a href="https://docs.memoh.ai/blogs/2026-02-16.html">Introduction to Memoh - The Case for an Always-On, Containerized Home Agent</a></p>
+  <p>给每个 AI Agent 一台云端电脑，开源<br>
+  桌面、浏览器、网络与长期记忆 — 即使关上笔记本，Agent 也不会停</p>
   <div align="center">
-    <img src="https://img.shields.io/github/package-json/v/memohai/Memoh" alt="Version" />
-    <img src="https://img.shields.io/github/license/memohai/Memoh" alt="License" />
-    <img src="https://img.shields.io/github/stars/memohai/Memoh?style=social" alt="Stars" />
-    <img src="https://img.shields.io/github/forks/memohai/Memoh?style=social" alt="Forks" />
-    <img src="https://img.shields.io/github/last-commit/memohai/Memoh" alt="Last Commit" />
-    <img src="https://img.shields.io/github/issues/memohai/Memoh" alt="Issues" />
+    <img src="https://img.shields.io/github/package-json/v/felinics/Memoh" alt="Version" />
+    <img src="https://img.shields.io/github/stars/felinics/Memoh?style=social" alt="Stars" />
+    <img src="https://img.shields.io/github/forks/felinics/Memoh?style=social" alt="Forks" />
+    <a href="https://deepwiki.com/felinics/Memoh">
+      <img src="https://deepwiki.com/badge.svg" alt="DeepWiki" />
+    </a>
+    <a href="https://t.me/memohai">
+      <img src="https://img.shields.io/badge/Telegram-Group-26A5E4?logo=telegram&logoColor=white" alt="Telegram" />
+    </a>
   </div>
-  <div align="center">
-    [<a href="https://t.me/memohai">Telegram 群组</a>]
-    [<a href="https://docs.memoh.ai">文档</a>]
-    [<a href="mailto:business@memoh.net">合作</a>]
-  </div>
-  <hr>
+  <h3>
+    <a href="https://app.memoh.net">Login</a> · <a href="#self-hosted">Self-hosted</a> · <a href="https://docs.memoh.ai">文档</a> · <a href="https://memoh.ai">官网</a> · <a href="https://x.com/memoh_ai">X</a>
+  </h3>
+  <img src="./assets/hero.png" alt="Memoh" width="1000">
 </div>
 
-Memoh 是一个 AI Agent 系统平台。用户可通过 Telegram、Discord、飞书(Lark) 等创建自己的 AI 机器人并与之对话。每个 bot 拥有独立的容器与记忆系统，可编辑文件、执行命令并自我构建——与 [OpenClaw](https://openclaw.ai) 类似，Memoh 为多 bot 管理提供更安全、灵活、可扩展的解决方案。
+## Memoh 是什么？
 
-## 快速开始
+Memoh 是一个开源的多智能体平台。每个 Agent 都有一台自己的云端电脑 — 独立的 Workspace，配有文件系统、桌面、浏览器、网络和长期记忆。你的 Agent 全天候在线，即使关上笔记本也不会停。
 
-一键安装（**需先安装 [Docker](https://www.docker.com/get-started/)**）：
+你可以用自己的 API Key 运行 Memoh 内置 Agent，也可以把已有的 Claude Code、Codex Agent 托管到 Memoh Workspace 里。
+
+通过 Telegram、Discord、飞书、微信、Web UI 等渠道与它们对话。它们能跨会话、跨平台记住上下文，操作浏览器，调用 MCP 工具，执行定时任务。给自己跑一个，给团队成员各分配一个，或一次拉起一组。
+
+## 开始使用
+
+### Memoh Cloud
+
+你现在可以直接去 [app.memoh.net](https://app.memoh.net) 注册登录账号。
+
+### Self-hosted
+
+在自己的基础设施上自托管完整服务。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/memohai/Memoh/main/scripts/install.sh | sh
+curl -fsSL https://memoh.sh | sh
 ```
 
-*静默安装（全部默认）：`curl -fsSL ... | sh -s -- -y`*
-
-或手动部署：
+<details>
+<summary><strong>更多部署选项</strong></summary>
 
 ```bash
-git clone --depth 1 https://github.com/memohai/Memoh.git
+git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/felinics/Memoh.git
 cd Memoh
+cp conf/app.docker.toml config.toml
+# 编辑 config.toml
+export MEMOH_INTERNAL_RPC_SHARED_SECRET="$(openssl rand -hex 32)"
 docker compose up -d
 ```
 
-启动后访问 <http://localhost:8082>。默认登录：`admin` / `admin123`
+Compose 会分别启动 Server 和 Channel 服务。请妥善保存内部 RPC 密钥，重新创建服务时继续使用同一个值。
 
-自定义配置与生产部署请参阅 [DEPLOYMENT.md](DEPLOYMENT.md)。
+拆分部署中，Channel 通过认证后的内部 Storage RPC 流式读写媒体，只有 Server 需要访问工作区和媒体存储。升级时先更新 Server，再更新 Channel，确保 Storage 服务已可用。
 
-## 为什么选择 Memoh？
+不使用 Docker（或从已有裸机部署升级）？在 `config.toml` 中将 `internal_rpc.shared_secret` 留空即可：Server 会内嵌 Channel 运行时，继续以单进程 all-in-one 方式运行——外部渠道、webhook 端点全部保留，无需运行 `memoh-channel` 进程。设置密钥则切换为双进程拆分部署。
 
-OpenClaw、Clawdbot、Moltbot 固然出色，但在稳定性、安全性、配置复杂度与 token 成本上仍有不足。若你正在寻找稳定、安全的 Bot SaaS 方案，不妨考虑我们的开源 Memoh。
+执行过 setup 的已有仓库仍然可以继续使用 `git pull`：post-merge hook 会初始化新增的
+submodule，setup 也会为后续 pull 启用递归更新。如果从未安装过该 hook，升级后只需执行
+一次 `mise run submodule-init`。GitHub 自动生成的
+“Source code” 压缩包不包含 submodule，请改用 Release 附件中的
+`Memoh-<version>-source.zip` 或 `.tar.gz` 完整源码包。
 
-Memoh 是基于 Golang 的多 bot agent 服务，提供 bot、Channel、MCP、Skills 等的完整图形化配置。我们使用 Containerd 为每个 bot 提供容器级隔离，并大量借鉴 OpenClaw 的 Agent 设计。
+> **镜像拉取慢时可用国内镜像：**
+> ```bash
+> curl -fsSL https://memoh.sh | USE_CN_MIRROR=true sh
+> ```
+>
+> 不要对整个安装脚本用 `sudo`。需要时脚本内部会自行调用 `sudo docker`。在 macOS 上，或用户已在 `docker` 组时，连 Docker 也不必 sudo。
 
-Memoh Bot 具备深度工程化的记忆层，灵感来自 Mem0：对每轮对话进行知识存储，实现更精准的记忆检索。
+自定义与生产环境见 [DEPLOYMENT.md](DEPLOYMENT.md)。
 
-Memoh Bot 能区分并记忆多人与多 bot 的请求，在任意群聊中无缝协作。你可以用 Memoh 组建 bot 团队，或为家人配置账号，用 bot 管理日常家务。
+</details>
 
-## 特性
-- **多 Bot 管理**：创建多个 bot；人与 bot、bot 与 bot 可私聊、群聊或协作。
-- **容器化**：每个 bot 运行在独立容器中，可在容器内自由执行命令、编辑文件、访问网络，宛如各自拥有一台电脑。
-- **记忆工程**：每次对话存入数据库，默认加载最近 24 小时上下文；每轮对话会存储为记忆，供 bot 通过语义检索召回。
-- **多平台**：支持 Telegram、飞书(Lark) 等。
-- **简单易用**：通过图形界面配置 Provider、Model、Memory、Channel、MCP、Skills 等，无需编码即可搭建自己的 AI 机器人。
-- **定时任务**：使用 cron 表达式在指定时间执行命令。
-- 更多…
+## 为什么选 Memoh？
 
-## 路线图
+- **每个 Agent 一台电脑**：独立 Workspace，自带文件系统、网络、桌面和浏览器
+- **多用户、多机器人**：给自己跑一个，给家人各部署一个，在一台机器上同时跑一群
+- **轻量**：可以自托管在自己的基础设施上，也可以连接 Memoh Cloud
 
-详见 [Roadmap Version 0.1](https://github.com/memohai/Memoh/issues/2)。
+## 为本项目拆出的子项目
 
-### 开发
+- [**Twilight AI**](https://github.com/felinics/twilight) — 给 Go 用的轻量 AI SDK，风格参考 [Vercel AI SDK](https://sdk.vercel.ai/)
+- [**Connect It**](https://github.com/felinics/connect-it) — 自托管的连接器网关，安全保存 SaaS 凭据，并通过单个 MCP 端点让 Agent 使用各种集成
+- [**UI**](https://github.com/felinics/ui) — 面向 AI Agent 管理界面的 Vue 3 设计系统，包含组件库、设计令牌，以及指导 Agent 正确使用它们的技能
 
-开发环境配置请参阅 [CONTRIBUTING.md](CONTRIBUTING.md)。
+## 项目状态
 
-## Star History
+![License](https://img.shields.io/github/license/felinics/Memoh) ![Last Commit](https://img.shields.io/github/last-commit/felinics/Memoh) ![Commit Activity](https://img.shields.io/github/commit-activity/m/felinics/Memoh) ![Issues](https://img.shields.io/github/issues/felinics/Memoh) ![Pull Requests](https://img.shields.io/github/issues-pr/felinics/Memoh)
 
-[![Star History Chart](https://api.star-history.com/svg?repos=memohai/Memoh&type=date&legend=top-left)](https://www.star-history.com/#memohai/Memoh&type=date&legend=top-left)
+## Star 历史
 
-## Contributors
+[![Star History Chart](https://star-history.dera.page/svg?repos=felinics/Memoh&type=date&legend=top-left)](https://star-history.dera.page/#felinics/Memoh&type=date&legend=top-left)
 
-<a href="https://github.com/memohai/Memoh/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=memohai/Memoh" />
+## 贡献者
+
+<a href="https://github.com/felinics/Memoh/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=felinics/Memoh" />
 </a>
 
-**LICENSE**: AGPLv3
+## 社区
 
-Copyright (C) 2026 Memoh. All rights reserved.
+- 🌐 [**网站**](https://memoh.ai)
+- 📚 [**文档**](https://docs.memoh.ai) — 安装、概念与指南
+- 🤝 [**合作**](mailto:business@memoh.net) — business@memoh.net
+- 💬 [**Telegram 群组**](https://t.me/memohai) — 交流与支持
+- 🛒 [**应用超市**](https://github.com/felinics/supermarket) — 整理好的技能与 MCP 模板
+
+---
+
+**许可证**：AGPLv3
+
+Made with ❤️ by MemohAI Team,
+
+Copyright (C) 2026 MemohAI (memoh.ai). All rights reserved.

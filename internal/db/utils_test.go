@@ -1,14 +1,75 @@
 package db
 
 import (
+	"errors"
 	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/felinics/memoh/internal/config"
 )
+
+func TestDSN(t *testing.T) {
+	cfg := config.PostgresConfig{
+		Host:     "localhost",
+		Port:     5432,
+		User:     "memoh",
+		Password: "testpw1",
+		Database: "memoh",
+		SSLMode:  "disable",
+	}
+	// Build want dynamically to avoid gosec G101 false positive on literal URLs containing passwords.
+	want := fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=%s", cfg.User, cfg.Password, cfg.Host, cfg.Port, cfg.Database, cfg.SSLMode)
+	if got := DSN(cfg); got != want {
+		t.Errorf("DSN() = %q, want %q", got, want)
+	}
+}
+
+func TestDSNEncodesSpecialCharacters(t *testing.T) {
+	specialValue := "pa" + "@ss word/#'\"\\"
+	cfg := config.PostgresConfig{
+		Host:     "localhost",
+		Port:     5432,
+		User:     "memoh@example",
+		Password: specialValue,
+		Database: "memoh",
+		SSLMode:  "disable",
+	}
+
+	parsed, err := url.Parse(DSN(cfg))
+	if err != nil {
+		t.Fatalf("DSN() produced invalid URL: %v", err)
+	}
+	if parsed.User.Username() != cfg.User {
+		t.Errorf("DSN() username = %q, want %q", parsed.User.Username(), cfg.User)
+	}
+	password, ok := parsed.User.Password()
+	if !ok {
+		t.Fatal("DSN() did not include a password")
+	}
+	if password != cfg.Password {
+		t.Errorf("DSN() password = %q, want %q", password, cfg.Password)
+	}
+	if parsed.Hostname() != cfg.Host {
+		t.Errorf("DSN() hostname = %q, want %q", parsed.Hostname(), cfg.Host)
+	}
+	if parsed.Port() != strconv.Itoa(cfg.Port) {
+		t.Errorf("DSN() port = %q, want %d", parsed.Port(), cfg.Port)
+	}
+	if parsed.Path != "/"+cfg.Database {
+		t.Errorf("DSN() path = %q, want /%s", parsed.Path, cfg.Database)
+	}
+	if parsed.Query().Get("sslmode") != cfg.SSLMode {
+		t.Errorf("DSN() sslmode = %q, want %q", parsed.Query().Get("sslmode"), cfg.SSLMode)
+	}
+}
 
 func TestParseUUID(t *testing.T) {
 	validUUID := uuid.MustParse("550e8400-e29b-41d4-a716-446655440000")
@@ -107,7 +168,7 @@ func TestIsUniqueViolation(t *testing.T) {
 		want bool
 	}{
 		{"nil", nil, false},
-		{"plain error", fmt.Errorf("some error"), false},
+		{"plain error", errors.New("some error"), false},
 		{"unique violation", &pgconn.PgError{Code: "23505"}, true},
 		{"other pg error", &pgconn.PgError{Code: "23503"}, false},
 		{"wrapped unique violation", fmt.Errorf("wrapped: %w", &pgconn.PgError{Code: "23505"}), true},
@@ -118,5 +179,15 @@ func TestIsUniqueViolation(t *testing.T) {
 				t.Errorf("IsUniqueViolation() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestParseUUIDReportsInvalidUUID(t *testing.T) {
+	_, err := ParseUUID("not-a-uuid")
+	if !errors.Is(err, ErrInvalidUUID) {
+		t.Fatalf("errors.Is(%v, ErrInvalidUUID) = false", err)
+	}
+	if !strings.HasPrefix(err.Error(), "invalid UUID: ") {
+		t.Fatalf("message changed: %q", err.Error())
 	}
 }

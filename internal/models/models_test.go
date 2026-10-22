@@ -3,100 +3,12 @@ package models_test
 import (
 	"testing"
 
-	"github.com/memohai/memoh/internal/models"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/felinics/memoh/internal/models"
 )
 
-// This is an example test file demonstrating how to use the models service
-// Actual tests would require database setup and mocking
-
-func ExampleService_Create() {
-	// Example usage - in real code, you would initialize with actual database connection
-	// service := models.NewService(queries)
-
-	// ctx := context.Background()
-	// req := models.AddRequest{
-	// 	ModelID:    "gpt-4",
-	// 	Name:       "GPT-4",
-	// 	LlmProviderID: "11111111-1111-1111-1111-111111111111",
-	// 	Type:       models.ModelTypeChat,
-	// }
-
-	// resp, err := service.Create(ctx, req)
-	// if err != nil {
-	// 	// handle error
-	// }
-	// fmt.Printf("Created model with ID: %s\n", resp.ID)
-}
-
-func ExampleService_GetByModelID() {
-	// Example usage
-	// service := models.NewService(queries)
-
-	// ctx := context.Background()
-	// resp, err := service.GetByModelID(ctx, "gpt-4")
-	// if err != nil {
-	// 	// handle error
-	// }
-	// fmt.Printf("Model: %+v\n", resp.Model)
-}
-
-func ExampleService_List() {
-	// Example usage
-	// service := models.NewService(queries)
-
-	// ctx := context.Background()
-	// models, err := service.List(ctx)
-	// if err != nil {
-	// 	// handle error
-	// }
-	// for _, model := range models {
-	// 	fmt.Printf("Model ID: %s, Type: %s\n", model.ModelID, model.Type)
-	// }
-}
-
-func ExampleService_ListByType() {
-	// Example usage
-	// service := models.NewService(queries)
-
-	// ctx := context.Background()
-	// chatModels, err := service.ListByType(ctx, models.ModelTypeChat)
-	// if err != nil {
-	// 	// handle error
-	// }
-	// fmt.Printf("Found %d chat models\n", len(chatModels))
-}
-
-func ExampleService_UpdateByModelID() {
-	// Example usage
-	// service := models.NewService(queries)
-
-	// ctx := context.Background()
-	// req := models.UpdateRequest{
-	// 	ModelID:    "gpt-4",
-	// 	Name:       "GPT-4 Turbo",
-	// 	LlmProviderID: "11111111-1111-1111-1111-111111111111",
-	// 	Type:       models.ModelTypeChat,
-	// }
-
-	// resp, err := service.UpdateByModelID(ctx, "gpt-4", req)
-	// if err != nil {
-	// 	// handle error
-	// }
-	// fmt.Printf("Updated model: %s\n", resp.ModelID)
-}
-
-func ExampleService_DeleteByModelID() {
-	// Example usage
-	// service := models.NewService(queries)
-
-	// ctx := context.Background()
-	// err := service.DeleteByModelID(ctx, "gpt-4")
-	// if err != nil {
-	// 	// handle error
-	// }
-	// fmt.Println("Model deleted successfully")
-}
+func intPtr(v int) *int { return &v }
 
 func TestModel_Validate(t *testing.T) {
 	tests := []struct {
@@ -107,45 +19,60 @@ func TestModel_Validate(t *testing.T) {
 		{
 			name: "valid chat model",
 			model: models.Model{
-				ModelID:       "gpt-4",
-				Name:          "GPT-4",
-				LlmProviderID: "11111111-1111-1111-1111-111111111111",
-				Type:          models.ModelTypeChat,
+				ModelID:    "gpt-4",
+				Name:       "GPT-4",
+				ProviderID: "11111111-1111-1111-1111-111111111111",
+				Type:       models.ModelTypeChat,
 			},
 			wantErr: false,
 		},
 		{
-			name: "valid chat model with modalities",
+			name: "valid chat model with compatibilities",
 			model: models.Model{
-				ModelID:         "gpt-4o",
-				Name:            "GPT-4o",
-				LlmProviderID:   "11111111-1111-1111-1111-111111111111",
-				InputModalities: []string{"text", "image", "audio"},
-				Type:            models.ModelTypeChat,
+				ModelID:    "gpt-4o",
+				Name:       "GPT-4o",
+				ProviderID: "11111111-1111-1111-1111-111111111111",
+				Type:       models.ModelTypeChat,
+				Config: models.ModelConfig{
+					Compatibilities: []string{"vision", "tool-call", "reasoning"},
+				},
 			},
 			wantErr: false,
+		},
+		{
+			name: "invalid chat model with unsupported reasoning effort",
+			model: models.Model{
+				ModelID:    "gpt-5.6-sol",
+				Name:       "GPT-5.6-Sol",
+				ProviderID: "11111111-1111-1111-1111-111111111111",
+				Type:       models.ModelTypeChat,
+				Config: models.ModelConfig{
+					ReasoningEfforts: []string{"low", "medium", "high", "xhigh", "max", "ultra"},
+				},
+			},
+			wantErr: true,
 		},
 		{
 			name: "valid embedding model",
 			model: models.Model{
-				ModelID:       "text-embedding-ada-002",
-				Name:          "Ada Embeddings",
-				LlmProviderID: "11111111-1111-1111-1111-111111111111",
-				Type:          models.ModelTypeEmbedding,
-				Dimensions:    1536,
+				ModelID:    "text-embedding-ada-002",
+				Name:       "Ada Embeddings",
+				ProviderID: "11111111-1111-1111-1111-111111111111",
+				Type:       models.ModelTypeEmbedding,
+				Config:     models.ModelConfig{Dimensions: intPtr(1536)},
 			},
 			wantErr: false,
 		},
 		{
 			name: "missing model_id",
 			model: models.Model{
-				LlmProviderID: "11111111-1111-1111-1111-111111111111",
-				Type:          models.ModelTypeChat,
+				ProviderID: "11111111-1111-1111-1111-111111111111",
+				Type:       models.ModelTypeChat,
 			},
 			wantErr: true,
 		},
 		{
-			name: "missing llm_provider_id",
+			name: "missing provider_id",
 			model: models.Model{
 				ModelID: "gpt-4",
 				Type:    models.ModelTypeChat,
@@ -153,40 +80,41 @@ func TestModel_Validate(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "invalid llm_provider_id",
+			name: "invalid provider_id",
 			model: models.Model{
-				ModelID:       "gpt-4",
-				LlmProviderID: "not-a-uuid",
-				Type:          models.ModelTypeChat,
+				ModelID:    "gpt-4",
+				ProviderID: "not-a-uuid",
+				Type:       models.ModelTypeChat,
 			},
 			wantErr: true,
 		},
 		{
 			name: "invalid model type",
 			model: models.Model{
-				ModelID:       "gpt-4",
-				LlmProviderID: "11111111-1111-1111-1111-111111111111",
-				Type:          "invalid",
+				ModelID:    "gpt-4",
+				ProviderID: "11111111-1111-1111-1111-111111111111",
+				Type:       "invalid",
 			},
 			wantErr: true,
 		},
 		{
 			name: "embedding model missing dimensions",
 			model: models.Model{
-				ModelID:       "text-embedding-ada-002",
-				LlmProviderID: "11111111-1111-1111-1111-111111111111",
-				Type:          models.ModelTypeEmbedding,
-				Dimensions:    0,
+				ModelID:    "text-embedding-ada-002",
+				ProviderID: "11111111-1111-1111-1111-111111111111",
+				Type:       models.ModelTypeEmbedding,
 			},
 			wantErr: true,
 		},
 		{
-			name: "invalid input modality",
+			name: "invalid compatibility",
 			model: models.Model{
-				ModelID:         "gpt-4",
-				LlmProviderID:   "11111111-1111-1111-1111-111111111111",
-				Type:            models.ModelTypeChat,
-				InputModalities: []string{"text", "smell"},
+				ModelID:    "gpt-4",
+				ProviderID: "11111111-1111-1111-1111-111111111111",
+				Type:       models.ModelTypeChat,
+				Config: models.ModelConfig{
+					Compatibilities: []string{"vision", "smell"},
+				},
 			},
 			wantErr: true,
 		},
@@ -204,73 +132,59 @@ func TestModel_Validate(t *testing.T) {
 	}
 }
 
-func TestModel_IsMultimodal(t *testing.T) {
-	tests := []struct {
-		name     string
-		model    models.Model
-		expected bool
-	}{
-		{
-			name: "text only",
-			model: models.Model{
-				InputModalities: []string{"text"},
-			},
-			expected: false,
-		},
-		{
-			name: "text and image",
-			model: models.Model{
-				InputModalities: []string{"text", "image"},
-			},
-			expected: true,
-		},
-		{
-			name: "text image audio video",
-			model: models.Model{
-				InputModalities: []string{"text", "image", "audio", "video"},
-			},
-			expected: true,
-		},
-		{
-			name:     "empty modalities",
-			model:    models.Model{},
-			expected: false,
+func TestModel_HasCompatibility(t *testing.T) {
+	m := models.Model{
+		Config: models.ModelConfig{
+			Compatibilities: []string{"vision", "tool-call", "reasoning"},
 		},
 	}
-	for _, tt := range tests {
+	assert.True(t, m.HasCompatibility("vision"))
+	assert.True(t, m.HasCompatibility("tool-call"))
+	assert.True(t, m.HasCompatibility("reasoning"))
+	assert.False(t, m.HasCompatibility("image-output"))
+}
+
+func TestModelConfigContextBudgetMaxTokens(t *testing.T) {
+	t.Parallel()
+
+	zero := 0
+	positive := 128000
+	for _, tt := range []struct {
+		name   string
+		config models.ModelConfig
+		want   int
+	}{
+		{name: "missing", config: models.ModelConfig{}, want: 0},
+		{name: "zero", config: models.ModelConfig{ContextWindow: &zero}, want: 0},
+		{name: "positive", config: models.ModelConfig{ContextWindow: &positive}, want: positive},
+	} {
+		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.expected, tt.model.IsMultimodal())
+			t.Parallel()
+			if got := tt.config.ContextBudgetMaxTokens(); got != tt.want {
+				t.Fatalf("ContextBudgetMaxTokens() = %d, want %d", got, tt.want)
+			}
 		})
 	}
 }
 
-func TestModel_HasInputModality(t *testing.T) {
-	m := models.Model{
-		InputModalities: []string{"text", "image", "audio"},
-	}
-	assert.True(t, m.HasInputModality("text"))
-	assert.True(t, m.HasInputModality("image"))
-	assert.True(t, m.HasInputModality("audio"))
-	assert.False(t, m.HasInputModality("video"))
-	assert.False(t, m.HasInputModality("file"))
-}
-
 func TestModelTypes(t *testing.T) {
 	t.Run("ModelType constants", func(t *testing.T) {
-		assert.Equal(t, models.ModelType("chat"), models.ModelTypeChat)
-		assert.Equal(t, models.ModelType("embedding"), models.ModelTypeEmbedding)
+		assert.Equal(t, models.ModelTypeChat, models.ModelType("chat"))
+		assert.Equal(t, models.ModelTypeEmbedding, models.ModelType("embedding"))
 	})
 
 	t.Run("ClientType constants", func(t *testing.T) {
-		assert.Equal(t, models.ClientType("openai"), models.ClientTypeOpenAI)
-		assert.Equal(t, models.ClientType("openai-compat"), models.ClientTypeOpenAICompat)
-		assert.Equal(t, models.ClientType("anthropic"), models.ClientTypeAnthropic)
-		assert.Equal(t, models.ClientType("google"), models.ClientTypeGoogle)
-		assert.Equal(t, models.ClientType("azure"), models.ClientTypeAzure)
-		assert.Equal(t, models.ClientType("bedrock"), models.ClientTypeBedrock)
-		assert.Equal(t, models.ClientType("mistral"), models.ClientTypeMistral)
-		assert.Equal(t, models.ClientType("xai"), models.ClientTypeXAI)
-		assert.Equal(t, models.ClientType("ollama"), models.ClientTypeOllama)
-		assert.Equal(t, models.ClientType("dashscope"), models.ClientTypeDashscope)
+		assert.Equal(t, models.ClientTypeOpenAIResponses, models.ClientType("openai-responses"))
+		assert.Equal(t, models.ClientTypeOpenAICompletions, models.ClientType("openai-completions"))
+		assert.Equal(t, models.ClientTypeAnthropicMessages, models.ClientType("anthropic-messages"))
+		assert.Equal(t, models.ClientTypeGoogleGenerativeAI, models.ClientType("google-generative-ai"))
 	})
+}
+
+func TestEnforcesMaxOutputTokens(t *testing.T) {
+	t.Parallel()
+
+	assert.False(t, models.EnforcesMaxOutputTokens(models.ClientTypeOpenAICodex))
+	assert.True(t, models.EnforcesMaxOutputTokens(models.ClientTypeOpenAIResponses))
 }
