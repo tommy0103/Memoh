@@ -21,8 +21,9 @@ import (
 // monotonic guard as the SQL write: the epoch must strictly increase and the
 // anchor may not move backward, otherwise the write is a stale no-op.
 type fakeContextEpochQueries struct {
-	mu     sync.Mutex
-	states map[string]string
+	mu             sync.Mutex
+	pinBudgetCalls int
+	states         map[string]string
 }
 
 func (f *fakeContextEpochQueries) GetSessionContextEpoch(_ context.Context, sessionID pgtype.UUID) (string, error) {
@@ -52,6 +53,47 @@ func (f *fakeContextEpochQueries) AdvanceSessionContextEpoch(_ context.Context, 
 	}
 	f.states[key] = string(arg.State)
 	return string(arg.State), nil
+}
+
+func (f *fakeContextEpochQueries) PinSessionContextEpochBudget(_ context.Context, arg sqlc.PinSessionContextEpochBudgetParams) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pinBudgetCalls++
+	key := arg.SessionID.String()
+	existing := f.states[key]
+	if existing == "" {
+		return "", pgx.ErrNoRows
+	}
+	var stored struct {
+		BudgetTokens int64 `json:"budget_tokens"`
+	}
+	if err := json.Unmarshal([]byte(existing), &stored); err != nil {
+		return "", err
+	}
+	if stored.BudgetTokens > 0 {
+		return "", pgx.ErrNoRows
+	}
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(existing), &raw); err != nil {
+		return "", err
+	}
+	raw["budget_tokens"] = arg.BudgetTokens
+	out, err := json.Marshal(raw)
+	if err != nil {
+		return "", err
+	}
+	f.states[key] = string(out)
+	return string(out), nil
+}
+
+func (f *fakeContextEpochQueries) setState(sessionID string, state contextepoch.State) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	raw, err := state.Encode()
+	if err != nil {
+		panic(err)
+	}
+	f.states[sessionID] = string(raw)
 }
 
 func (f *fakeContextEpochQueries) state(sessionID string) contextepoch.State {
